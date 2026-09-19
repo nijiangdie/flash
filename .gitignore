@@ -1,0 +1,14 @@
+# 本地数据：数据库与平台登录态，含个人采集记录，绝不入库
+data/
+reports/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 临时日志与调试产物
+*.log
+server-test-*
+_smoke_*.png
