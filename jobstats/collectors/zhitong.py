@@ -1,156 +1,174 @@
-"""智通直聘 (job5156.com) 采集器【实验性】。
+"""智通直聘 (job5156.com) 采集器：无需登录、无需浏览器。
 
-搜索结果由前端动态加载、接口不固定，这里采用两层策略：
-1. XHR 通用嗅探：拦截所有 JSON 响应，自动识别包含职位数组的结构；
-2. DOM 兜底：解析 job-card 系列卡片。
-接口变化时可能采不到数据——主力平台建议用 boss / job51。
+2026-09-23 实测：搜索结果页是服务端渲染的 HTML，每条职位是一个
+`<li class="position pos-item PosName" data-...>`，字段全在 data-* 属性里；
+翻页参数是 `pn`。站点的 WAF 会先发 CT6T cookie 再 302，带 cookie jar 重跟即可，
+所以直接走 HTTP，不再用浏览器嗅探 XHR（旧实现选 `.job-card` 一直选空，才落得"实验性"）。
+
+合规说明：仅采集公开职位列表字段；随机限速；每日额度熔断。
 """
-import json
-import time
+import html
+import http.cookiejar
+import re
+import urllib.parse
+import urllib.request
 
 from .. import db
-from ..browser import polite_sleep, check_daily_cap, launch
-from ..config import MAX_PAGES_DEFAULT
+from ..browser import polite_sleep, check_daily_cap
+from ..config import MAX_PAGES_DEFAULT, REQUEST_TIMEOUT_MS
 
 SITE = "https://www.job5156.com"
+SEARCH_URL = f"{SITE}/s/search/"
+# 城市直接用中文名传参（实测有效）；“全国”留空即不传
+NO_CITY = {"", "全国"}
 
-# 常用城市拼音前缀（来自站点城市列表）
-CITY_CODES = {
-    "全国": "", "东莞": "dongguan", "深圳": "shenzhen", "广州": "guangzhou",
-    "佛山": "foshan", "中山": "zhongshan", "惠州": "huizhou", "珠海": "zhuhai",
-    "长沙": "changsha", "武汉": "wuhan", "南京": "nanjing", "宁波": "ningbo",
-    "南昌": "nanchang", "湘潭": "xiangtan", "泉州": "quanzhou",
-}
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
-# XHR JSON 中识别职位数组用的字段名候选
-_TITLE_KEYS = ["posName", "jobName", "positionName", "zwName", "name"]
-_COMPANY_KEYS = ["coName", "companyName", "comName", "corpName"]
-_SALARY_KEYS = ["salary", "zwSalary", "salaryStr", "salaryDesc", "pay"]
-_CITY_KEYS = ["site", "cityName", "areaName", "workPlace", "address"]
-_EXP_KEYS = ["workYear", "exp", "experience", "yearReq"]
-_EDU_KEYS = ["degreeStr", "education", "eduReq", "degree"]
+# 职位条目：<li ... class="position pos-item PosName" ...>
+_ITEM_RE = re.compile(r'<li\b([^>]*class="[^"]*pos-item[^"]*"[^>]*)>')
+_ATTR_RE = re.compile(r'data-([a-z0-9-]+)="([^"]*)"')
+_SALARY_RE = re.compile(r'class="salary"[^>]*>(.*?)</', re.S)
+_TAG_RE = re.compile(r'class="tag-list-item"[^>]*>(.*?)</', re.S)
+_WELFARE_RE = re.compile(r'class="pos-welfare"[^>]*title="([^"]*)"')
+_BLANK_RE = re.compile(r"\s+")
+
+_cookie_jar = http.cookiejar.CookieJar()
+_opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_cookie_jar))
 
 
 def login():
     print("[zhitong] 智通直聘搜索列表无需登录，跳过。")
 
 
-def _find_job_lists(obj, out):
-    """递归查找 JSON 里『看起来像职位列表』的数组。"""
-    if isinstance(obj, list):
-        if obj and all(isinstance(x, dict) for x in obj):
-            sample = obj[0]
-            if any(k in sample for k in _TITLE_KEYS) and any(k in sample for k in _SALARY_KEYS + _CITY_KEYS):
-                out.extend(obj)
-        for x in obj:
-            _find_job_lists(x, out)
-    elif isinstance(obj, dict):
-        for v in obj.values():
-            _find_job_lists(v, out)
+def _clean(text: str) -> str:
+    return _BLANK_RE.sub(" ", html.unescape(text or "")).strip()
 
 
-def _map_item(d: dict) -> dict | None:
-    def g(keys):
-        for k in keys:
-            if d.get(k):
-                return str(d[k])
-        return ""
-    jid = str(d.get("jobId") or d.get("posId") or d.get("id") or "")
-    title = g(_TITLE_KEYS)
+def _search_url(query: str, city: str, page: int) -> str:
+    params = {"keyword": query, "searchKeywordFrom": "1", "dataVersion": ""}
+    if city and city not in NO_CITY:
+        params["city"] = city
+    if page > 1:
+        params["pn"] = str(page)
+    return f"{SEARCH_URL}?{urllib.parse.urlencode(params)}"
+
+
+def _fetch(url: str) -> str:
+    req = urllib.request.Request(url, headers={
+        "User-Agent": _UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Referer": f"{SITE}/",
+    })
+    with _opener.open(req, timeout=REQUEST_TIMEOUT_MS / 1000) as resp:
+        return resp.read().decode("utf-8", "replace")
+
+
+def _salary(attrs: dict, block: str):
+    """优先用页面展示的薪资文本，展示位缺失时退回条目上的数字属性。"""
+    m = _SALARY_RE.search(block)
+    raw = _clean(m.group(1)) if m else ""
+    parsed = db.parse_salary(raw)
+    if parsed:
+        return raw, parsed[0], parsed[1], parsed[2]
+    lo, hi = _num(attrs.get("minsalary")), _num(attrs.get("maxsalary"))
+    if lo and hi:
+        return f"{lo / 1000:g}-{hi / 1000:g}K", lo / 1000, hi / 1000, None
+    return raw, None, None, None
+
+
+def _num(text):
+    try:
+        v = float(text)
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None
+
+
+def parse_page(body: str) -> list[dict]:
+    """把搜索结果页 HTML 解析成职位记录列表（纯函数，便于离线测试）。"""
+    marks = list(_ITEM_RE.finditer(body))
+    records = []
+    for i, m in enumerate(marks):
+        start = m.end()
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(body)
+        block = body[start:end]
+        attrs = dict(_ATTR_RE.findall(m.group(1)))
+        rec = _record(attrs, block)
+        if rec:
+            records.append(rec)
+    return records
+
+
+def _district(city: str, block: str) -> str:
+    """镇区藏在“城市-镇区”那枚标签里。"""
+    for raw in _TAG_RE.findall(block):
+        parts = _clean(raw).split("-", 1)
+        if len(parts) == 2 and parts[1] and (not city or parts[0] == city):
+            return parts[1]
+    return ""
+
+
+def _record(attrs: dict, block: str) -> dict | None:
+    jid = attrs.get("id") or attrs.get("positionkey")
+    title = _clean(attrs.get("posname"))
     if not jid or not title:
         return None
-    raw_salary = g(_SALARY_KEYS)
-    if "面议" in raw_salary:
-        raw_salary = ""
-    parsed = db.parse_salary(raw_salary)
-    lo, hi = (parsed[0], parsed[1]) if parsed else (None, None)
-    area = g(_CITY_KEYS)
-    city, _, district = area.partition("·") if area else ("", "", "")
+    key = attrs.get("positionkey") or jid
+    city_en = attrs.get("urlcityen") or ""
+    city = _clean(attrs.get("cityname"))
+    salary_raw, lo, hi, months = _salary(attrs, block)
+    district = _clean(attrs.get("townname")) or _district(city, block)
+    industry = "-".join(x for x in (_clean(attrs.get("first")), _clean(attrs.get("second"))) if x)
+    wm = _WELFARE_RE.search(block)
+    welfare = [w.strip() for w in _clean(wm.group(1)).split(",")] if wm else []
     return {
         "platform": "zhitong",
-        "platform_job_id": jid,
+        "platform_job_id": str(jid),
         "title": title,
-        "company": g(_COMPANY_KEYS),
-        "salary_raw": raw_salary,
-        "salary_min": lo, "salary_max": hi, "salary_months": None,
-        "city": city, "district": district,
-        "experience": g(_EXP_KEYS), "education": g(_EDU_KEYS),
-        "industry": "", "company_scale": "",
-        "skills": [], "welfare": [], "url": "",
+        "company": _clean(attrs.get("comname")),
+        "salary_raw": salary_raw,
+        "salary_min": lo, "salary_max": hi, "salary_months": months,
+        "city": city,
+        "district": district,
+        "experience": _clean(attrs.get("reqworkyear")),
+        "education": _clean(attrs.get("reqdegreestr")),
+        "industry": industry,
+        "company_scale": "",
+        "skills": [],
+        "welfare": welfare,
+        "url": f"{SITE}/{city_en}/job_{key}" if city_en else "",
     }
 
 
 def collect(query: str, city: str = "东莞", max_pages: int = MAX_PAGES_DEFAULT) -> list[dict]:
     daily_remaining = check_daily_cap()
-    prefix = CITY_CODES.get(city, "")
     all_jobs: dict[str, dict] = {}
 
-    p, browser = launch(headless=False)  # 实验性通道建议有头运行，便于观察
-    try:
-        ctx = browser.new_context(locale="zh-CN", timezone_id="Asia/Shanghai")
-        page = ctx.new_page()
-
-        def on_response(resp):
-            if resp.request.resource_type not in ("xhr", "fetch"):
-                return
-            ct = resp.headers.get("content-type", "")
-            if "json" not in ct:
-                return
-            try:
-                data = resp.json()
-            except Exception:
-                return
-            found: list = []
-            _find_job_lists(data, found)
-            for d in found:
-                rec = _map_item(d)
-                if rec:
-                    all_jobs.setdefault(rec["platform_job_id"], rec)
-
-        page.on("response", on_response)
-
-        for pno in range(1, max_pages + 1):
-            if len(all_jobs) >= daily_remaining:
-                break
-            base = f"{SITE}/{prefix}/" if prefix else f"{SITE}/"
-            url = f"{base}search/?keyword={query}&page={pno}"
-            print(f"[zhitong] 第 {pno}/{max_pages} 页: {query} @ {city}（实验性）")
-            try:
-                page.goto(url, wait_until="domcontentloaded")
-            except Exception as e:
-                print(f"  页面加载失败: {str(e)[:80]}")
-                break
-            time.sleep(6)
-            page.mouse.wheel(0, 2500)
-            time.sleep(2)
-            # DOM 兜底
-            cards = page.locator(".job-card")
-            for i in range(cards.count()):
-                c = cards.nth(i)
-                try:
-                    title = c.locator(".job-card_posName").first.inner_text(timeout=1000).strip()
-                except Exception:
-                    continue
-                jid = title  # DOM 兜底没有稳定 id，用标题+公司当键
-                try:
-                    company = c.locator(".job-card_logo + *, [class*=company]").first.inner_text(timeout=1000).strip()
-                except Exception:
-                    company = ""
-                try:
-                    salary = c.locator(".job-card_tip1, [class*=salary]").first.inner_text(timeout=1000).strip()
-                except Exception:
-                    salary = ""
-                rec = _map_item({"posName": title, "coName": company, "salary": salary,
-                                 "site": city, "id": f"dom:{jid}:{company}"})
-                if rec:
-                    all_jobs.setdefault(rec["platform_job_id"], rec)
-            if pno < max_pages:
-                polite_sleep()
-        page.close()
-    finally:
-        browser.close()
-        p.stop()
+    for pno in range(1, max_pages + 1):
+        if len(all_jobs) >= daily_remaining:
+            print(f"  已达今日剩余额度 {daily_remaining} 条，停止。")
+            break
+        print(f"[zhitong] 第 {pno}/{max_pages} 页: {query} @ {city}")
+        try:
+            body = _fetch(_search_url(query, city, pno))
+        except Exception as e:
+            print(f"  页面获取失败: {str(e)[:90]}，停止翻页。")
+            break
+        page_jobs = parse_page(body)
+        if not page_jobs:
+            print("  本页没解析出职位（无结果，或页面结构变了），停止翻页。")
+            break
+        before = len(all_jobs)
+        for rec in page_jobs:
+            all_jobs.setdefault(rec["platform_job_id"], rec)
+        if len(all_jobs) == before:
+            print("  本页没有新增职位（可能已翻到头），停止翻页。")
+            break
+        if pno < max_pages:
+            polite_sleep()
 
     records = list(all_jobs.values())[:daily_remaining]
-    print(f"[zhitong] 本次去重后采集 {len(records)} 条（实验性通道，结果可能不完整）")
+    print(f"[zhitong] 本次去重后采集 {len(records)} 条")
     return records

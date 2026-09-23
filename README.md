@@ -33,7 +33,7 @@ python cli.py serve
 ```bash
 # 1. 采集（job51 / zhitong 无需登录，开箱可用）
 python cli.py collect --platform job51 --query "python" --city 全国 --pages 3
-python cli.py collect --platform zhitong --query "python" --city 东莞   # 实验性
+python cli.py collect --platform zhitong --query "python" --city 东莞 --pages 2
 
 # 2. 只有 Boss直聘 要先登录一次（用本机真实 Edge，扫码后按回车验证）
 python cli.py login boss --edge
@@ -61,7 +61,14 @@ python cli.py export
 |---|---|---|---|
 | Boss直聘 | 同源直连 `wapi/zpgeek/search/joblist.json` | 需要（走真实 Edge，见下） | ⚠️ 通道可用，容易触发风控 |
 | 前程无忧 | we.51job.com 卡片 sensorsdata 解析 | 不需要 | ✅ 已实测，**日常主力** |
-| 智通直聘 | XHR 通用嗅探 + DOM 兜底 | 不需要 | ⚠️ 实验性，接口不稳定 |
+| 智通直聘 | 搜索页服务端渲染 HTML，直连解析条目 `data-*` 字段 | 不需要 | ✅ 已实测，**连浏览器都不用开** |
+
+**智通直聘（2026-09-23 实测）**：`/s/search/?keyword=&city=&pn=` 返回的就是渲染好的 HTML，每条职位是
+`<li class="position pos-item PosName" data-...>`，标题/公司/薪资/镇区/学历/经验/福利全在 `data-*` 属性里，
+所以用最普通的 HTTP 请求就能采，不用登录也不用开浏览器（实测 30 条/页，镇区与公司零缺失）。
+站点前面有道 WAF 会先发 `CT6T` cookie 再 302 一次，带 cookie jar 自动重跟即可。翻页参数是 `pn`
+（第 2 页与第 1 页 0 重复）。旧实现之所以"实验性"，是因为它选了 `.job-card`——那是**首页**卡片的类名前缀，
+结果页用的是 `pos-item`，所以永远选空。
 
 **Boss直聘 为什么单独一套流程（2026-09-19 实测）**：Playwright 自建的浏览器能打开 zhipin.com，
 但十几秒后会被平台的安全脚本清成 `about:blank`；去掉自动化标记、换 Edge 二进制、独立用户目录都躲不掉。
@@ -101,7 +108,7 @@ job-stats/
 │   └── collectors/
 │       ├── boss.py         # Boss直聘采集器
 │       ├── job51.py        # 前程无忧采集器
-│       └── zhitong.py      # 智通直聘采集器（实验性）
+│       └── zhitong.py      # 智通直聘采集器（纯 HTTP，不用浏览器）
 ├── tests/                  # 单元测试：python -m unittest discover -s tests
 ├── data/                   # 数据库 + 登录态（自动生成，勿外传；Boss 的浏览器配置在 %LOCALAPPDATA%）
 └── reports/                # 生成的 HTML

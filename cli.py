@@ -84,7 +84,7 @@ def main():
     p = sub.add_parser("collect", help="采集职位数据")
     p.add_argument("--platform", required=True, choices=list(COLLECTORS))
     p.add_argument("--query", required=True, help="搜索关键词，如 python")
-    p.add_argument("--city", default="全国", help="城市名（boss/job51/zhitong 支持的城市见模块内 CITY_CODES）")
+    p.add_argument("--city", default="全国", help="城市名（boss/job51 用模块内 CITY_CODES 的城市，zhitong 直接传中文城市名）")
     p.add_argument("--pages", type=int, default=5, help="本次最多翻几页（默认 5）")
     p.set_defaults(func=cmd_collect)
 

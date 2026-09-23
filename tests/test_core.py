@@ -12,7 +12,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from jobstats import browser, db, report
+from jobstats import browser, config, db, report
 from jobstats.collectors import boss
 
 SLOT_NAMES = ("__SUB_LINE__", "__GENERATED_AT__", "__N__", "__DATA__", "__TOKEN__",
@@ -356,6 +356,97 @@ class TestLoginState(unittest.TestCase):
     def test_collect_session_still_refreshes_state(self):
         self._session(save_state=True).__exit__()
         self.assertTrue(self.storage.exists())
+
+
+def zt_item(jid="12406875", poskey="TdFLo0K2", **over):
+    """按智通真实结构造一条职位：<li data-*...> + 内部展示元素。"""
+    attrs = {
+        "id": jid, "positionkey": poskey, "urlcityen": "dongguan", "cityname": "东莞",
+        "townname": "", "posname": "修模师傅", "comname": "东莞市利松五金科技有限公司",
+        "first": "生产制造", "second": "模具", "reqdegreestr": "中专",
+        "reqworkyear": "经验5年及以上", "minsalary": "10000", "maxsalary": "11000",
+    }
+    attrs.update(over)
+    tag = "<li " + " ".join(f'data-{k}="{v}"' for k, v in attrs.items()) + \
+          ' class="position pos-item PosName">'
+    return (tag +
+            '<div class="pos-item-top flex_Ac"><div class="salary">' +
+            (over.get("shown_salary") or "10-11K") + "</div>"
+            '<div class="info-tags flex_Ac">'
+            '<div class="tag-list-item">' + (attrs["cityname"] + "-长安镇") + "</div>"
+            '<div class="tag-list-item">' + attrs["reqdegreestr"] + "</div>"
+            '</div>'
+            '<p class="pos-welfare" title="五险,包吃,包住">五险、包吃、包住</p>'
+            "</div></li>")
+
+
+def zt_page(*items):
+    return "<html><ul>" + "".join(items) + "</ul></html>"
+
+
+class TestZhitongParse(unittest.TestCase):
+    def setUp(self):
+        from jobstats.collectors import zhitong
+        self.mod = zhitong
+
+    def test_parses_fields_from_data_attrs(self):
+        recs = self.mod.parse_page(zt_page(zt_item()))
+        self.assertEqual(len(recs), 1)
+        r = recs[0]
+        self.assertEqual(r["platform"], "zhitong")
+        self.assertEqual(r["platform_job_id"], "12406875")
+        self.assertEqual(r["title"], "修模师傅")
+        self.assertEqual(r["company"], "东莞市利松五金科技有限公司")
+        self.assertEqual((r["salary_min"], r["salary_max"]), (10.0, 11.0))
+        self.assertEqual(r["city"], "东莞")
+        self.assertEqual(r["district"], "长安镇")
+        self.assertEqual(r["industry"], "生产制造-模具")
+        self.assertEqual(r["welfare"], ["五险", "包吃", "包住"])
+        self.assertEqual(r["url"], "https://www.job5156.com/dongguan/job_TdFLo0K2")
+        self.assertLessEqual(set(r), set(config.ALLOWED_FIELDS))
+
+    def test_townname_attr_wins_over_tag(self):
+        r = self.mod.parse_page(zt_page(zt_item(townname="松山湖")))[0]
+        self.assertEqual(r["district"], "松山湖")
+
+    def test_negotiable_salary_has_no_numbers(self):
+        body = zt_page(zt_item(shown_salary="面议", minsalary="", maxsalary=""))
+        r = self.mod.parse_page(body)[0]
+        self.assertEqual(r["salary_raw"], "面议")
+        self.assertIsNone(r["salary_min"])
+        self.assertIsNone(r["salary_max"])
+
+    def test_only_li_items_count(self):
+        body = ('<div class="position pos-item PosName"></div>'
+                + zt_page(zt_item(jid="1"), zt_item(jid="2", poskey="B")))
+        self.assertEqual(len(self.mod.parse_page(body)), 2)
+
+    def test_item_without_id_or_title_is_dropped(self):
+        self.assertEqual(self.mod.parse_page(zt_page(zt_item(posname=""))), [])
+
+    def test_collect_stops_when_page_adds_nothing(self):
+        pages = [zt_page(zt_item(jid="1"), zt_item(jid="2", poskey="B")),
+                 zt_page(zt_item(jid="3", poskey="C")),
+                 zt_page(zt_item(jid="3", poskey="C"))]
+        with mock.patch.object(self.mod, "_fetch", side_effect=pages) as fetch, \
+             mock.patch.object(self.mod, "check_daily_cap", return_value=200), \
+             mock.patch.object(self.mod, "polite_sleep"):
+            recs = self.mod.collect("IT", "东莞", max_pages=5)
+        self.assertEqual(len(recs), 3)
+        self.assertEqual(fetch.call_count, 3)
+
+    def test_fetch_error_keeps_what_was_collected(self):
+        with mock.patch.object(self.mod, "_fetch",
+                              side_effect=[zt_page(zt_item(jid="1")), OSError("连接重置")]), \
+             mock.patch.object(self.mod, "check_daily_cap", return_value=200), \
+             mock.patch.object(self.mod, "polite_sleep"):
+            recs = self.mod.collect("IT", "东莞", max_pages=5)
+        self.assertEqual(len(recs), 1)
+
+    def test_page_two_uses_pn_param(self):
+        self.assertIn("pn=2", self.mod._search_url("IT", "东莞", 2))
+        self.assertNotIn("pn=1", self.mod._search_url("IT", "东莞", 1))
+        self.assertNotIn("city=", self.mod._search_url("IT", "全国", 1))
 
 
 if __name__ == "__main__":
