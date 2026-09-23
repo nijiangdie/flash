@@ -31,13 +31,13 @@ python cli.py serve
 命令行方式（不需要界面时用）：
 
 ```bash
-# 1. 首次使用：登录 Boss直聘（会打开浏览器，扫码后自动保存登录态）
-python cli.py login boss
-
-# 2. 采集（job51 / zhitong 无需登录）
-python cli.py collect --platform boss  --query "python" --city 深圳 --pages 5
+# 1. 采集（job51 / zhitong 无需登录，开箱可用）
 python cli.py collect --platform job51 --query "python" --city 全国 --pages 3
 python cli.py collect --platform zhitong --query "python" --city 东莞   # 实验性
+
+# 2. 只有 Boss直聘 要先登录一次（用本机真实 Edge，扫码后按回车验证）
+python cli.py login boss --edge
+python cli.py collect --platform boss  --query "python" --city 深圳 --pages 5   # 采集时保持 Edge 窗口开着
 
 # 3. 看报告（浏览器打开生成的 HTML）
 python cli.py report                     # → reports/report.html
@@ -59,9 +59,32 @@ python cli.py export
 
 | 平台 | 方式 | 登录 | 成熟度 |
 |---|---|---|---|
-| Boss直聘 | 搜索页 wapi JSON 拦截 | 需要（扫码一次，登录态可复用） | ✅ 主力 |
-| 前程无忧 | we.51job.com 卡片 sensorsdata 解析 | 不需要 | ✅ 已实测 |
+| Boss直聘 | 同源直连 `wapi/zpgeek/search/joblist.json` | 需要（走真实 Edge，见下） | ⚠️ 通道可用，容易触发风控 |
+| 前程无忧 | we.51job.com 卡片 sensorsdata 解析 | 不需要 | ✅ 已实测，**日常主力** |
 | 智通直聘 | XHR 通用嗅探 + DOM 兜底 | 不需要 | ⚠️ 实验性，接口不稳定 |
+
+**Boss直聘 为什么单独一套流程（2026-09-19 实测）**：Playwright 自建的浏览器能打开 zhipin.com，
+但十几秒后会被平台的安全脚本清成 `about:blank`；去掉自动化标记、换 Edge 二进制、独立用户目录都躲不掉。
+改成**用本机真实 Edge 打开页面、事后用 CDP 接管**（`--edge`），实测接管后页面不再被清空。
+
+```bash
+python cli.py login boss --edge     # 弹出真实 Edge，扫码登录，回命令行按回车检查登录凭证
+```
+
+登录判据是 cookie 里的 `bst` / `zp_at`（匿名访问只有 `__a`/`__c`/`__g` 之类），检查用的是浏览器级
+API，不依赖任何标签页——Boss 的 SPA 跳转会把接管的标签页换掉，靠 Page 对象会崩。
+采集同样不开页面、不监听响应（响应体在 CDP 下经常取不到），而是用同一个登录上下文
+直接 `ctx.request.get` 调搜索接口翻页。
+
+**采集前那个 Edge 窗口必须还开着**。窗口关了会直接提示你重跑一次 `login boss --edge`
+（profile 里已有 cookie，弹出来后按回车即通过），不会再偷偷退回自建浏览器——那条死路只会
+换回一个 `code=37`，还让人误判成"风控了"。
+这条通道专用的浏览器配置刻意放在项目外：`%LOCALAPPDATA%\job-stats\edge-profile`。
+Edge 会往任何用户目录里塞自带组件和缓存（实测 100M+），放项目外免得拖大工程体积；
+登录状态在里面，勿外传。
+
+**风控实测**：Edge 通道下单页请求正常返回 15 条；连续多页/短时间内反复请求会返回
+`code=37 您的环境存在异常`。遇到就停手，隔天再跑，一次一页足够。
 
 ## 目录结构
 
@@ -80,12 +103,15 @@ job-stats/
 │       ├── job51.py        # 前程无忧采集器
 │       └── zhitong.py      # 智通直聘采集器（实验性）
 ├── tests/                  # 单元测试：python -m unittest discover -s tests
-├── data/                   # 数据库 + 登录态（自动生成，勿外传）
+├── data/                   # 数据库 + 登录态（自动生成，勿外传；Boss 的浏览器配置在 %LOCALAPPDATA%）
 └── reports/                # 生成的 HTML
 ```
 
 `serve` 只绑定 `127.0.0.1`，页面接口带一次性 token（每次启动重新生成），
 用于挡住本机其它进程/网页的跨站请求；采集接口会真实驱动浏览器，不要转发或反代该端口。
+
+Boss 的 Edge 通道同理只监听 `127.0.0.1:9223`，那是那个窗口的调试端口，本机任何进程都能驱动它——
+用完关掉窗口即可，同样不要转发或反代。
 
 ## 测试
 

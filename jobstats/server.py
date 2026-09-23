@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import db, report
 from .collectors import boss, job51, zhitong
-from .config import AUTH_DIR, DAILY_CAP, MAX_PAGES_DEFAULT
+from .config import DAILY_CAP, MAX_PAGES_DEFAULT
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -211,11 +211,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": False, "error": "不支持的平台"}, 400)
         if not query:
             return self._json({"ok": False, "error": "请输入搜索关键词"}, 400)
-        if platform == "boss" and not (AUTH_DIR / "boss_storage.json").exists():
-            return self._json(
-                {"ok": False,
-                 "error": "Boss直聘需要先登录一次：在命令行运行 `python cli.py login boss`，登录后再回来采集。"},
-                400)
+        if platform == "boss":
+            err = boss.channel_error()
+            if err:
+                return self._json({"ok": False, "error": err}, 400)
 
         task, err = self.manager.start(platform, query, city, pages)
         if err:

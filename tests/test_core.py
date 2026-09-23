@@ -8,10 +8,12 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from jobstats import browser, db, report
+from jobstats.collectors import boss
 
 SLOT_NAMES = ("__SUB_LINE__", "__GENERATED_AT__", "__N__", "__DATA__", "__TOKEN__",
               "__CITY_OPTIONS__", "__COLLECT_PANEL__", "__COLLECT_SCRIPT__", "__BOOT_HOOK__")
@@ -201,6 +203,159 @@ class TestRenderers(unittest.TestCase):
         html = report.render_web(recs, "SECRETTOKEN", "")
         self.assertIn("const TOKEN = 'SECRETTOKEN';", html)
         self.assertEqual(len(re.findall(r"const TOKEN = ", html)), 1)
+
+
+def job_item(jid: str, name: str = "IT运维工程师"):
+    return {"encryptJobId": jid, "jobName": name, "salaryDesc": "6-8K",
+            "cityName": "东莞", "jobExperience": "1-3年", "jobDegree": "大专"}
+
+
+def job_page(code=0, items=(), has_more=True, message="Success"):
+    return {"code": code, "message": message,
+            "zpData": {"jobList": list(items), "hasMore": has_more}}
+
+
+class TestBossHarvest(unittest.TestCase):
+    """翻页逻辑离线可测：接口返回什么就怎么停，不能因为一页出错丢掉已采到的。"""
+
+    class _Resp:
+        def __init__(self, payload, status=200):
+            self.payload, self.status = payload, status
+
+        def json(self):
+            return self.payload
+
+    class _Req:
+        def __init__(self, payloads, recorder):
+            self.payloads, self.recorder = list(payloads), recorder
+
+        def get(self, url, params=None, headers=None):
+            self.recorder.append(dict(params))
+            return TestBossHarvest._Resp(self.payloads.pop(0))
+
+    class _Ctx:
+        def __init__(self, payloads):
+            self.calls = []
+            self.request = TestBossHarvest._Req(payloads, self.calls)
+
+    def setUp(self):
+        patch = mock.patch.object(boss, "polite_sleep", lambda: None)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_pages_until_has_more_false(self):
+        ctx = self._Ctx([
+            job_page(items=[job_item("a"), job_item("b")], has_more=True),
+            job_page(items=[job_item("c")], has_more=False),
+        ])
+        jobs = boss._harvest(ctx, "IT", "东莞", "101281600", 5, 200)
+        self.assertEqual(sorted(jobs), ["a", "b", "c"])
+        self.assertEqual([c["page"] for c in ctx.calls], [1, 2])
+
+    def test_stops_on_risk_code_and_keeps_partial(self):
+        ctx = self._Ctx([
+            job_page(items=[job_item("a")], has_more=True),
+            job_page(code=37, items=[], message="您的环境存在异常"),
+        ])
+        jobs = boss._harvest(ctx, "IT", "东莞", "101281600", 5, 200)
+        self.assertEqual(list(jobs), ["a"])
+
+    def test_dedupes_repeated_ids_and_stops(self):
+        ctx = self._Ctx([
+            job_page(items=[job_item("a")], has_more=True),
+            job_page(items=[job_item("a")], has_more=True),
+        ])
+        jobs = boss._harvest(ctx, "IT", "东莞", "101281600", 5, 200)
+        self.assertEqual(list(jobs), ["a"])
+        self.assertEqual(len(ctx.calls), 2)  # 第二页无新增即停，不继续打接口
+
+    def test_stops_at_daily_remaining(self):
+        ctx = self._Ctx([job_page(items=[job_item("a"), job_item("b")])])
+        jobs = boss._harvest(ctx, "IT", "东莞", "101281600", 5, 1)
+        self.assertEqual(len(jobs), 2)  # 当页收完即停，截断在 collect() 里做
+        self.assertEqual(len(ctx.calls), 1)
+
+
+class TestEdgeChannel(unittest.TestCase):
+    """Boss 的真实 Edge 通道：接不上时必须给出可操作的提示，而不是白跑一轮。"""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.auth = Path(tmp.name)
+        self.patch_auth = mock.patch.object(boss, "AUTH_DIR", self.auth)
+        self.patch_auth.start()
+
+    def _logged_in(self):
+        (self.auth / "boss_storage.json").write_text("{}", encoding="utf-8")
+
+    def _alive(self, value):
+        return mock.patch.object(boss, "cdp_alive", lambda port=0: value)
+
+    def test_channel_error_without_login(self):
+        with self._alive(False):
+            self.assertIn("login boss --edge", boss.channel_error())
+
+    def test_channel_error_when_window_closed(self):
+        self._logged_in()
+        with self._alive(False):
+            self.assertIn("Edge 窗口", boss.channel_error())
+
+    def test_channel_silent_when_ready(self):
+        self._logged_in()
+        with self._alive(True):
+            self.assertIsNone(boss.channel_error())
+
+    def test_edge_exe_raises_when_not_installed(self):
+        with mock.patch.object(browser, "EDGE_PATHS", ("Z:/nope/msedge.exe",)):
+            with self.assertRaises(RuntimeError):
+                browser.edge_exe()
+
+    def test_cdp_alive_false_without_listener(self):
+        self.assertFalse(browser.cdp_alive(port=1))
+
+    def test_attach_refuses_without_window(self):
+        with mock.patch.object(browser, "cdp_alive", lambda port=0: False):
+            with self.assertRaises(RuntimeError):
+                with browser.attach():
+                    self.fail("不该进入上下文")
+
+
+class TestLoginState(unittest.TestCase):
+    """登录失败不得留下登录态文件——否则服务端会误判「已登录」，采集才静默拿到 0 条。"""
+
+    class _Ctx:
+        def storage_state(self, path):
+            Path(path).write_text("{}", encoding="utf-8")
+
+    class _Closer:
+        def close(self):
+            pass
+
+        def stop(self):
+            pass
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.storage = Path(tmp.name) / "boss_storage.json"
+
+    def _session(self, save_state):
+        s = browser.Session("boss", save_state=save_state)
+        s.storage = self.storage
+        s._context = self._Ctx()
+        s._browser = s._p = self._Closer()
+        return s
+
+    def test_login_session_saves_only_on_success(self):
+        self._session(save_state=False).__exit__()
+        self.assertFalse(self.storage.exists())
+        self._session(save_state=False).save()
+        self.assertTrue(self.storage.exists())
+
+    def test_collect_session_still_refreshes_state(self):
+        self._session(save_state=True).__exit__()
+        self.assertTrue(self.storage.exists())
 
 
 if __name__ == "__main__":

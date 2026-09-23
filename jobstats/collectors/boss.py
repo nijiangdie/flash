@@ -1,18 +1,18 @@
-"""Boss直聘采集器：登录态 + 搜索页翻页 + 拦截 wapi/joblist.json 结构化数据。
+"""Boss直聘采集器：真实 Edge 登录态 + 直接调用搜索接口分页。
 
 合规说明：仅采集公开职位列表字段；随机限速；每日额度熔断。
 """
-import json
-import math
 import re
-import time
-from urllib.parse import quote
 
-from ..browser import polite_sleep, check_daily_cap, Session, interactive_login
-from ..config import MAX_PAGES_DEFAULT
+from ..browser import (polite_sleep, check_daily_cap, attach, cdp_alive,
+                       interactive_login, login_with_edge)
+from ..config import AUTH_DIR, MAX_PAGES_DEFAULT
 
 SEARCH_URL = "https://www.zhipin.com/web/geek/jobs"
+API_SEARCH = "https://www.zhipin.com/wapi/zpgeek/search/joblist.json"
 LOGIN_URL = "https://www.zhipin.com/"
+# 实测：匿名访问只会拿到 __a/__c/__g/lastCity 之类，登录后才多发这两个
+LOGIN_COOKIES = {"bst", "zp_at"}
 
 # 常用城市代码（Boss 站点口径），不在表内可传原始代码或“全国”
 CITY_CODES = {
@@ -35,6 +35,22 @@ def login():
         except Exception:
             return False
     interactive_login("boss", LOGIN_URL, check)
+
+
+def login_edge():
+    """用本机真实 Edge 登录：Boss 会把 Playwright 自建的浏览器页面清空，这条通道不会。"""
+    login_with_edge("boss", LOGIN_URL, LOGIN_COOKIES)
+
+
+def channel_error() -> str | None:
+    """采集前自检 Boss 通道，返回该展示给用户的提示；可用则返回 None。"""
+    if not (AUTH_DIR / "boss_storage.json").exists():
+        return ("Boss直聘 需要先登录：在 job-stats 文件夹的地址栏输入 cmd 回车，运行 "
+                "python cli.py login boss --edge，在弹出的 Edge 窗口里扫码登录。")
+    if not cdp_alive():
+        return ("已登录，但没找到那个 Edge 窗口（可能被关闭了）。请再运行一次 "
+                "python cli.py login boss --edge，它会直接打开已登录的页面。")
+    return None
 
 
 def _parse_item(item: dict) -> dict | None:
@@ -68,59 +84,64 @@ def _parse_item(item: dict) -> dict | None:
     }
 
 
+def _harvest(ctx, query: str, city: str, city_code: str, max_pages: int,
+             daily_remaining: int) -> dict[str, dict]:
+    """用已登录的浏览器上下文直接调搜索接口，逐页收集职位。
+
+    刻意不开标签页、也不监听响应：SPA 跳转会把接管的标签页换掉，响应体也经常
+    取不到（No resource with given identifier）。直接请求只依赖登录 cookie，实测稳定。
+    """
+    all_jobs: dict[str, dict] = {}
+    for pno in range(1, max_pages + 1):
+        if len(all_jobs) >= daily_remaining:
+            print(f"  已达今日剩余额度 {daily_remaining} 条，停止。")
+            break
+        print(f"[boss] 第 {pno}/{max_pages} 页: {query} @ {city}")
+        resp = ctx.request.get(
+            API_SEARCH, params={"query": query, "city": city_code, "page": pno},
+            headers={"Referer": SEARCH_URL, "Accept": "application/json, text/plain, */*"})
+        if resp.status != 200:
+            print(f"  接口返回 HTTP {resp.status}，停止。")
+            break
+        data = resp.json()
+        if data.get("code") != 0:
+            print(f"  接口返回 code={data.get('code')}"
+                  f"（平台提示：{data.get('message') or '无'}），停止翻页，保留已采到的部分。")
+            break
+        zpData = data.get("zpData") or {}
+        before = len(all_jobs)
+        for item in zpData.get("jobList") or []:
+            rec = _parse_item(item)
+            if rec:
+                all_jobs[rec["platform_job_id"]] = rec
+        if len(all_jobs) == before:
+            print("  本页没有新增职位（无结果或已翻到头），停止翻页。")
+            break
+        if not zpData.get("hasMore"):
+            print("  平台提示已无下一页，停止。")
+            break
+        if pno < max_pages:
+            polite_sleep()
+    return all_jobs
+
+
 def collect(query: str, city: str = "全国", max_pages: int = MAX_PAGES_DEFAULT) -> list[dict]:
+    # 绝不自建浏览器兜底：那样必然被风控，白烧一次额度还给出误导性的"触发风控"结论
+    err = channel_error()
+    if err:
+        raise RuntimeError(err)
+
     daily_remaining = check_daily_cap()
     city_code = CITY_CODES.get(city, city)
-    all_jobs: dict[str, dict] = {}
 
-    with Session("boss") as ctx:
-        page = ctx.new_page()
+    print("[boss] 使用本机 Edge 通道（采集期间请保持那个窗口开着）")
+    with attach() as ctx:
+        jobs = _harvest(ctx, query, city, city_code, max_pages, daily_remaining)
 
-        def on_response(resp):
-            if "joblist.json" not in resp.url or not resp.ok:
-                return
-            try:
-                data = resp.json()
-            except Exception:
-                return
-            if data.get("code") != 0:
-                code = data.get("code")
-                raise RuntimeError(
-                    f"Boss 返回异常 code={code}（403/4104 等通常为风控触发）。"
-                    "请降低频率、稍后再试，或重新 login 刷新登录态。"
-                )
-            for item in data.get("zpData", {}).get("jobList", []) or []:
-                rec = _parse_item(item)
-                if rec:
-                    all_jobs[rec["platform_job_id"]] = rec
-
-        page.on("response", on_response)
-        before_prev = 0
-
-        for pno in range(1, max_pages + 1):
-            if len(all_jobs) >= daily_remaining:
-                print(f"  已达今日剩余额度 {daily_remaining} 条，停止。")
-                break
-            url = f"{SEARCH_URL}?query={quote(query)}&city={city_code}&page={pno}"
-            print(f"[boss] 第 {pno}/{max_pages} 页: {query} @ {city}")
-            page.goto(url, wait_until="domcontentloaded")
-            try:
-                page.wait_for_selector(".job-card-wrapper, .job-list-box", timeout=15000)
-            except Exception:
-                print("  未检测到职位卡片（可能触发验证码或已无更多数据），停止。")
-                break
-            page.mouse.wheel(0, 3000)  # 触发懒加载
-            time.sleep(2)
-            current = len(all_jobs)
-            if pno > 1 and current == before_prev:
-                print("  本页无新增数据，停止翻页。")
-                break
-            before_prev = current
-            if pno < max_pages:
-                polite_sleep()
-
-        page.close()
-
-    records = list(all_jobs.values())[:daily_remaining]
+    records = list(jobs.values())[:daily_remaining]
+    if not records:
+        raise RuntimeError(
+            "一条都没采到：多为触发风控或登录态失效。请隔一段时间再试，"
+            "或重新运行 python cli.py login boss --edge 刷新登录。")
     print(f"[boss] 本次去重后采集 {len(records)} 条")
     return records

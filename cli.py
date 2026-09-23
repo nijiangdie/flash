@@ -4,6 +4,7 @@
 用法示例：
   python cli.py serve                        # 启动本地筛选台（采集+筛选都在页面里，推荐）
   python cli.py login boss                   # 打开浏览器登录 Boss直聘（保存登录态）
+  python cli.py login boss --edge            # 用本机真实 Edge 登录（平台拦截自动化浏览器时用）
   python cli.py collect --platform boss --query "python" --city 深圳 --pages 5
   python cli.py collect --platform job51 --query "python" --city 全国 --pages 3
   python cli.py collect --platform zhitong --query "python" --city 东莞
@@ -25,12 +26,15 @@ COLLECTORS = {"boss": boss, "job51": job51, "zhitong": zhitong}
 
 
 def cmd_login(args):
-    if args.platform not in ("boss",):
-        print("目前只有 Boss直聘 需要登录（51job / 智通的搜索列表无需登录）。")
-        if args.platform in COLLECTORS:
-            COLLECTORS[args.platform].login()
+    mod = COLLECTORS[args.platform]
+    if args.edge:
+        fn = getattr(mod, "login_edge", None)
+        if fn is None:
+            print(f"{args.platform} 没有 Edge 登录通道（该平台无需登录）。")
+            return
+        fn()
         return
-    boss.login()
+    mod.login()
 
 
 def cmd_collect(args):
@@ -73,6 +77,8 @@ def main():
 
     p = sub.add_parser("login", help="平台登录（目前仅 boss 需要）")
     p.add_argument("platform", choices=["boss", "job51", "zhitong"])
+    p.add_argument("--edge", action="store_true",
+                   help="用本机真实 Edge 登录（Boss直聘 拦截自动化浏览器时走这条）")
     p.set_defaults(func=cmd_login)
 
     p = sub.add_parser("collect", help="采集职位数据")
@@ -100,7 +106,15 @@ def main():
     p.set_defaults(func=cmd_serve)
 
     args = ap.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        print("\n[中止] 已手动取消。", file=sys.stderr)
+        sys.exit(1)
+    except RuntimeError as e:
+        # 风控/额度/超时属可预期失败，给结论即可，不必甩堆栈
+        print(f"\n[中止] {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
