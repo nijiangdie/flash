@@ -212,9 +212,10 @@ class Handler(BaseHTTPRequestHandler):
         if not query:
             return self._json({"ok": False, "error": "请输入搜索关键词"}, 400)
         if platform == "boss":
-            err = boss.channel_error()
-            if err:
-                return self._json({"ok": False, "error": err}, 400)
+            # 通道不在就先替他把 Edge 弹出来，页面上点一下就能走完，不用去命令行敲命令
+            hint = boss.ensure_window()
+            if hint:
+                return self._json({"ok": False, "error": hint}, 400)
 
         task, err = self.manager.start(platform, query, city, pages)
         if err:

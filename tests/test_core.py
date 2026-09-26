@@ -336,14 +336,20 @@ class TestBossChannel(unittest.TestCase):
 
 
 class TestEdgeChannel(unittest.TestCase):
-    """Boss 的真实 Edge 通道：接不上时必须给出可操作的提示，而不是白跑一轮。"""
+    """Boss 的真实 Edge 通道：点一下『开始采集』就该自己把窗口弹出来。"""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.auth = Path(tmp.name)
-        self.patch_auth = mock.patch.object(boss, "AUTH_DIR", self.auth)
-        self.patch_auth.start()
+        self.opened = []
+        patch_auth = mock.patch.object(boss, "AUTH_DIR", self.auth)
+        patch_auth.start()
+        self.addCleanup(patch_auth.stop)
+        patch_open = mock.patch.object(boss, "open_edge",
+                                       lambda url="": self.opened.append(url))
+        patch_open.start()
+        self.addCleanup(patch_open.stop)
 
     def _logged_in(self):
         (self.auth / "boss_storage.json").write_text("{}", encoding="utf-8")
@@ -351,19 +357,24 @@ class TestEdgeChannel(unittest.TestCase):
     def _alive(self, value):
         return mock.patch.object(boss, "cdp_alive", lambda port=0: value)
 
-    def test_channel_error_without_login(self):
+    def test_first_time_pops_login_window_and_tells_user_to_rescan(self):
         with self._alive(False):
-            self.assertIn("login boss --edge", boss.channel_error())
+            hint = boss.ensure_window()
+        self.assertIn("扫码登录", hint)
+        self.assertIn("再点一次", hint)
+        self.assertEqual(self.opened, [boss.LOGIN_URL])
 
-    def test_channel_error_when_window_closed(self):
+    def test_reopens_window_without_asking_for_commands(self):
         self._logged_in()
-        with self._alive(False):
-            self.assertIn("Edge 窗口", boss.channel_error())
+        with self._alive(False), mock.patch("builtins.print"):
+            self.assertIsNone(boss.ensure_window())
+        self.assertEqual(self.opened, [boss.LOGIN_URL])  # 自己弹，不叫用户去敲 login
 
-    def test_channel_silent_when_ready(self):
+    def test_silent_when_window_already_up(self):
         self._logged_in()
         with self._alive(True):
-            self.assertIsNone(boss.channel_error())
+            self.assertIsNone(boss.ensure_window())
+        self.assertEqual(self.opened, [])  # 已就绪就不该再开一个窗口
 
     def test_edge_exe_raises_when_not_installed(self):
         with mock.patch.object(browser, "EDGE_PATHS", ("Z:/nope/msedge.exe",)):

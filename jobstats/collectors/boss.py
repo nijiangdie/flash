@@ -6,7 +6,7 @@ import re
 
 from playwright.sync_api import Error as PlaywrightError
 
-from ..browser import (polite_sleep, check_daily_cap, attach, cdp_alive,
+from ..browser import (polite_sleep, check_daily_cap, attach, cdp_alive, open_edge,
                        interactive_login, login_with_edge)
 from ..config import AUTH_DIR, MAX_PAGES_DEFAULT
 
@@ -44,14 +44,19 @@ def login_edge():
     login_with_edge("boss", LOGIN_URL, LOGIN_COOKIES)
 
 
-def channel_error() -> str | None:
-    """采集前自检 Boss 通道，返回该展示给用户的提示；可用则返回 None。"""
+def ensure_window() -> str | None:
+    """把 Boss 通道准备到能采集的状态；还需要人工登录时返回要展示的话术。
+
+    命令行和页面『开始采集』都走这里：登录态存在专用 Edge 配置目录里，
+    窗口没了就自己重新弹出来，不用用户去记 login 命令。
+    """
     if not (AUTH_DIR / "boss_storage.json").exists():
-        return ("Boss直聘 需要先登录：在 job-stats 文件夹的地址栏输入 cmd 回车，运行 "
-                "python cli.py login boss --edge，在弹出的 Edge 窗口里扫码登录。")
+        open_edge(LOGIN_URL)
+        return ("已弹出 Edge 登录窗口，请在里面完成扫码登录（只有这一次需要扫），"
+                "然后回到这里再点一次『开始采集』。")
     if not cdp_alive():
-        return ("已登录，但没找到那个 Edge 窗口（可能被关闭了）。请再运行一次 "
-                "python cli.py login boss --edge，它会直接打开已登录的页面。")
+        print("[boss] 那个 Edge 窗口不在，正在重新打开（配置里已有登录态，不用扫码）…")
+        open_edge(LOGIN_URL)
     return None
 
 
@@ -166,9 +171,9 @@ def _harvest(channel: Channel, query: str, city: str, city_code: str,
 
 def collect(query: str, city: str = "全国", max_pages: int = MAX_PAGES_DEFAULT) -> list[dict]:
     # 绝不自建浏览器兜底：那样必然被风控，白烧一次额度还给出误导性的"触发风控"结论
-    err = channel_error()
-    if err:
-        raise RuntimeError(err)
+    hint = ensure_window()
+    if hint:
+        raise RuntimeError(hint)
 
     daily_remaining = check_daily_cap()
     city_code = CITY_CODES.get(city, city)
