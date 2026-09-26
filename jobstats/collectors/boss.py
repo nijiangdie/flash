@@ -4,6 +4,8 @@
 """
 import re
 
+from playwright.sync_api import Error as PlaywrightError
+
 from ..browser import (polite_sleep, check_daily_cap, attach, cdp_alive,
                        interactive_login, login_with_edge)
 from ..config import AUTH_DIR, MAX_PAGES_DEFAULT
@@ -84,8 +86,49 @@ def _parse_item(item: dict) -> dict | None:
     }
 
 
-def _harvest(ctx, query: str, city: str, city_code: str, max_pages: int,
-             daily_remaining: int) -> dict[str, dict]:
+def _first_line(exc: BaseException) -> str:
+    """只取异常第一行。
+
+    Playwright 的报错会附一整段 Call log，里面原样带着请求头——包括 bst/zp_at 登录凭证，
+    绝不能跟着 traceback 一起打进终端。
+    """
+    return (str(exc).splitlines() or [type(exc).__name__])[0]
+
+
+class Channel:
+    """一次请求一次接管：不长期持有 ctx。
+
+    真实 Edge 随时可能被关掉或被后台实例接管，一旦 CDP 断开，攒下来的 ctx 就变成
+    `Request context disposed`，整轮采集跟着报废。逐页重连接只多几毫秒，断了却只需重试那一页。
+    """
+
+    def __init__(self, attach_fn=attach, retries: int = 2):
+        self._attach = attach_fn
+        self._retries = retries
+
+    def get_json(self, params: dict) -> dict | None:
+        last = ""
+        for _ in range(self._retries):
+            try:
+                with self._attach() as ctx:
+                    resp = ctx.request.get(
+                        API_SEARCH, params=params,
+                        headers={"Referer": SEARCH_URL,
+                                 "Accept": "application/json, text/plain, */*"})
+                    if resp.status != 200:
+                        print(f"  接口返回 HTTP {resp.status}，停止。")
+                        return None
+                    return resp.json()
+            except (PlaywrightError, RuntimeError) as e:
+                last = _first_line(e)
+                print(f"  Edge 通道中断（{last}），重新接管后重试本页。")
+        raise RuntimeError(
+            f"Boss 通道反复中断（{last}）。采集期间请把那个 Edge 窗口保持打开；"
+            "如果它总是自己退出，先关掉所有 Edge 窗口再运行 python cli.py login boss --edge。")
+
+
+def _harvest(channel: Channel, query: str, city: str, city_code: str,
+             max_pages: int, daily_remaining: int) -> dict[str, dict]:
     """用已登录的浏览器上下文直接调搜索接口，逐页收集职位。
 
     刻意不开标签页、也不监听响应：SPA 跳转会把接管的标签页换掉，响应体也经常
@@ -97,13 +140,9 @@ def _harvest(ctx, query: str, city: str, city_code: str, max_pages: int,
             print(f"  已达今日剩余额度 {daily_remaining} 条，停止。")
             break
         print(f"[boss] 第 {pno}/{max_pages} 页: {query} @ {city}")
-        resp = ctx.request.get(
-            API_SEARCH, params={"query": query, "city": city_code, "page": pno},
-            headers={"Referer": SEARCH_URL, "Accept": "application/json, text/plain, */*"})
-        if resp.status != 200:
-            print(f"  接口返回 HTTP {resp.status}，停止。")
+        data = channel.get_json({"query": query, "city": city_code, "page": pno})
+        if data is None:
             break
-        data = resp.json()
         if data.get("code") != 0:
             print(f"  接口返回 code={data.get('code')}"
                   f"（平台提示：{data.get('message') or '无'}），停止翻页，保留已采到的部分。")
@@ -135,8 +174,7 @@ def collect(query: str, city: str = "全国", max_pages: int = MAX_PAGES_DEFAULT
     city_code = CITY_CODES.get(city, city)
 
     print("[boss] 使用本机 Edge 通道（采集期间请保持那个窗口开着）")
-    with attach() as ctx:
-        jobs = _harvest(ctx, query, city, city_code, max_pages, daily_remaining)
+    jobs = _harvest(Channel(), query, city, city_code, max_pages, daily_remaining)
 
     records = list(jobs.values())[:daily_remaining]
     if not records:

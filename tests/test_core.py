@@ -7,8 +7,11 @@ import re
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
+
+from playwright.sync_api import Error as PlaywrightError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -215,28 +218,28 @@ def job_page(code=0, items=(), has_more=True, message="Success"):
             "zpData": {"jobList": list(items), "hasMore": has_more}}
 
 
+class FakeResp:
+    """假 HTTP 响应，够覆盖 _harvest 用到的 status/json 两个成员。"""
+
+    def __init__(self, payload, status=200):
+        self.payload, self.status = payload, status
+
+    def json(self):
+        return self.payload
+
+
 class TestBossHarvest(unittest.TestCase):
     """翻页逻辑离线可测：接口返回什么就怎么停，不能因为一页出错丢掉已采到的。"""
 
-    class _Resp:
-        def __init__(self, payload, status=200):
-            self.payload, self.status = payload, status
+    class _Chan:
+        """假通道：按顺序吐出 payloads；None 表示这一页没拿到内容。"""
 
-        def json(self):
-            return self.payload
-
-    class _Req:
-        def __init__(self, payloads, recorder):
-            self.payloads, self.recorder = list(payloads), recorder
-
-        def get(self, url, params=None, headers=None):
-            self.recorder.append(dict(params))
-            return TestBossHarvest._Resp(self.payloads.pop(0))
-
-    class _Ctx:
         def __init__(self, payloads):
-            self.calls = []
-            self.request = TestBossHarvest._Req(payloads, self.calls)
+            self.calls, self.payloads = [], list(payloads)
+
+        def get_json(self, params):
+            self.calls.append(dict(params))
+            return self.payloads.pop(0)
 
     def setUp(self):
         patch = mock.patch.object(boss, "polite_sleep", lambda: None)
@@ -244,36 +247,92 @@ class TestBossHarvest(unittest.TestCase):
         self.addCleanup(patch.stop)
 
     def test_pages_until_has_more_false(self):
-        ctx = self._Ctx([
+        chan = self._Chan([
             job_page(items=[job_item("a"), job_item("b")], has_more=True),
             job_page(items=[job_item("c")], has_more=False),
         ])
-        jobs = boss._harvest(ctx, "IT", "东莞", "101281600", 5, 200)
+        jobs = boss._harvest(chan, "IT", "东莞", "101281600", 5, 200)
         self.assertEqual(sorted(jobs), ["a", "b", "c"])
-        self.assertEqual([c["page"] for c in ctx.calls], [1, 2])
+        self.assertEqual([c["page"] for c in chan.calls], [1, 2])
 
     def test_stops_on_risk_code_and_keeps_partial(self):
-        ctx = self._Ctx([
+        chan = self._Chan([
             job_page(items=[job_item("a")], has_more=True),
             job_page(code=37, items=[], message="您的环境存在异常"),
         ])
-        jobs = boss._harvest(ctx, "IT", "东莞", "101281600", 5, 200)
+        jobs = boss._harvest(chan, "IT", "东莞", "101281600", 5, 200)
         self.assertEqual(list(jobs), ["a"])
 
     def test_dedupes_repeated_ids_and_stops(self):
-        ctx = self._Ctx([
+        chan = self._Chan([
             job_page(items=[job_item("a")], has_more=True),
             job_page(items=[job_item("a")], has_more=True),
         ])
-        jobs = boss._harvest(ctx, "IT", "东莞", "101281600", 5, 200)
+        jobs = boss._harvest(chan, "IT", "东莞", "101281600", 5, 200)
         self.assertEqual(list(jobs), ["a"])
-        self.assertEqual(len(ctx.calls), 2)  # 第二页无新增即停，不继续打接口
+        self.assertEqual(len(chan.calls), 2)  # 第二页无新增即停，不继续打接口
 
     def test_stops_at_daily_remaining(self):
-        ctx = self._Ctx([job_page(items=[job_item("a"), job_item("b")])])
-        jobs = boss._harvest(ctx, "IT", "东莞", "101281600", 5, 1)
+        chan = self._Chan([job_page(items=[job_item("a"), job_item("b")])])
+        jobs = boss._harvest(chan, "IT", "东莞", "101281600", 5, 1)
         self.assertEqual(len(jobs), 2)  # 当页收完即停，截断在 collect() 里做
-        self.assertEqual(len(ctx.calls), 1)
+        self.assertEqual(len(chan.calls), 1)
+
+    def test_stops_when_channel_gives_nothing(self):
+        chan = self._Chan([job_page(items=[job_item("a")], has_more=True), None])
+        jobs = boss._harvest(chan, "IT", "东莞", "101281600", 5, 200)
+        self.assertEqual(list(jobs), ["a"])
+        self.assertEqual(len(chan.calls), 2)
+
+
+class TestBossChannel(unittest.TestCase):
+    """CDP 会话说断就断（Edge 窗口被关/被后台实例接管），通道必须自愈且不外泄凭证。"""
+
+    # Playwright 的报错会把整段 Call log 带出来，里面原样含请求头
+    DISPOSED = ("APIRequestContext.get: Request context disposed.\nCall log:\n"
+                "  - → GET https://www.zhipin.com/wapi/zpgeek/search/joblist.json\n"
+                "    - cookie: bst=SECRET_BST; zp_at=SECRET_ZP_AT")
+
+    def _attach_fn(self, results):
+        """造一个假的接管函数：每次 attach 交出一个 request.get 表现为 results[i] 的 ctx。"""
+        @contextmanager
+        def attach():
+            outcome = results.pop(0)
+
+            class Req:
+                def get(self, url, params=None, headers=None):
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    return outcome
+
+            class Ctx:
+                request = Req()
+
+            yield Ctx()
+
+        return attach
+
+    def test_reconnects_and_retries_the_same_page(self):
+        chan = boss.Channel(attach_fn=self._attach_fn(
+            [PlaywrightError(self.DISPOSED), FakeResp(job_page(items=[job_item("a")]))]),
+            retries=2)
+        self.assertEqual(chan.get_json({"page": 1})["code"], 0)
+
+    def test_gives_up_without_printing_cookies(self):
+        chan = boss.Channel(attach_fn=self._attach_fn(
+            [PlaywrightError(self.DISPOSED), PlaywrightError(self.DISPOSED)]), retries=2)
+        with mock.patch("builtins.print") as out:
+            with self.assertRaises(RuntimeError) as cm:
+                chan.get_json({"page": 1})
+        for line in [str(cm.exception)] + [c.args[0] for c in out.call_args_list if c.args]:
+            self.assertNotIn("SECRET_BST", line)
+            self.assertNotIn("SECRET_ZP_AT", line)
+        self.assertIn("保持打开", str(cm.exception))
+
+    def test_http_error_returns_none(self):
+        chan = boss.Channel(attach_fn=self._attach_fn([FakeResp({}, status=503)]), retries=1)
+        with mock.patch("builtins.print"):
+            self.assertIsNone(chan.get_json({"page": 1}))
 
 
 class TestEdgeChannel(unittest.TestCase):

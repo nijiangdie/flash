@@ -183,11 +183,17 @@ def login_with_edge(platform: str, url: str, login_cookies: set[str]) -> None:
     print(f"[{platform}] 已在 Edge 打开登录页，请在该窗口完成登录（扫码/短信均可）。")
     while True:
         input("          登录完成后回到这里按回车检查（不想登录按 Ctrl+C 退出）... ")
-        with attach() as ctx:
-            names = {c["name"] for c in ctx.cookies()}
-            got = names & login_cookies
-            if got:
-                ctx.storage_state(path=str(AUTH_DIR / f"{platform}_storage.json"))
+        try:
+            with attach() as ctx:
+                names = {c["name"] for c in ctx.cookies()}
+                got = names & login_cookies
+                if got:
+                    ctx.storage_state(path=str(AUTH_DIR / f"{platform}_storage.json"))
+        except RuntimeError:
+            # 这里的 attach 失败几乎总是那个窗口中途没了，不是"还没登录"
+            raise RuntimeError(
+                "刚才那个 Edge 窗口已经不在了（被关掉，或被别的 Edge 实例接管）。"
+                "请先关掉所有 Edge 窗口，再重新运行本命令，登录完别再关那个窗口。")
         if got:
             print(f"[{platform}] 登录成功（检测到 {', '.join(sorted(got))}），"
                   f"已保存到 data/auth/{platform}_storage.json")
