@@ -50,17 +50,20 @@ def cmd_collect(args):
 
 
 def cmd_report(args):
+    db.init_db()
     out = report.generate(demo=args.demo)
     print(f"报告已生成：{out}")
 
 
 def cmd_browse(args):
+    db.init_db()
     out = report.generate_browser(demo=args.demo)
     print(f"筛选台已生成：{out}")
     print("双击该 HTML 文件即可使用（所有筛选在本地实时生效）。")
 
 
 def cmd_export(args):
+    db.init_db()
     out = Path(args.out or "data/export.csv")
     out.parent.mkdir(parents=True, exist_ok=True)
     db.export_csv(out)

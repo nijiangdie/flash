@@ -11,11 +11,37 @@
 
 ## 安装
 
+**只需要双击 `install.bat`**（安装逻辑在 `install.py`，批处理只负责找到 Python 并启动它）。
+它会检查 Python 版本 → 在项目里建一个独立的 `.venv` → 装 playwright → 下载采集用的
+浏览器内核 → 最后跑一遍离线自检测试（不联网、不采集）。装完以后不用再碰它，中途网络断了
+就重新双击一次，已完成的步骤会自动跳过。
+
+手工装（不用 `.venv`，直接系统 Python）等价于：
+
 ```bash
-# 使用已有 venv（已装好 playwright 可跳过）
-pip install playwright
+pip install -r requirements.txt
 playwright install chromium
 ```
+
+### 拷给别人跑（Windows）
+
+把项目文件夹整个拷过去（或压缩发过去），对方只需要两步：
+
+1. 装 Python 3.10 或更高（代码用了 `str | None` 这类新语法，3.9 导入就报错），
+   官网安装页面 `https://www.python.org/downloads/`，安装时勾选 *Add python.exe to PATH*
+2. 双击 `install.bat`，跑完再双击 `start.bat`
+
+依赖只有一个 `playwright`，数据库用 Python 自带的 SQLite，都不用另装。
+Boss 那家用的是对方自己电脑上的 Edge，不需要下载；智通直聘纯 HTTP，连浏览器都不开。
+
+**别把 `data/` 拷给别人**：里面是 `jobs.db`（你的采集记录）和 `data/auth/*`
+（你的平台登录 cookie，等于你的账号登录态）。要给的只有代码：`cli.py`、`install.bat`、
+`install.py`、`start.bat`、`README.md`、`requirements.txt`、`jobstats/`、`tests/`。对方首次运行会自己
+生成空库。`reports/` 是生成产物，也不用给。Boss 那份浏览器配置在项目外
+（`%LOCALAPPDATA%\job-stats\edge-profile`），跟着文件夹拷不过去，对方要采 Boss 得自己扫一次码。
+
+`.venv` 是**按机器**生成的（里面写死了绝对路径），换机器就删掉它重新双击 `install.bat`；
+浏览器内核默认装在 `%LOCALAPPDATA%\ms-playwright`，同一台机器上多个副本共用一份，不会重复下载。
 
 ## 使用
 
@@ -49,11 +75,17 @@ python cli.py browse                     # → reports/jobs-browser.html
 python cli.py report --demo
 python cli.py browse --demo
 
-# 附：导出 CSV
+# 附：导出 CSV（Excel 可直接打开）
 python cli.py export
+python cli.py export --out 我的投递清单.csv
 ```
 
 一次采集建议一天跑 1~2 个关键词即可，多跑几天数据自然积累。
+
+导出的 19 列里，除了平台原文的 `salary_raw`，还给了 `salary_min / salary_max /
+salary_months / salary_annual_wan`（年薪估算，万元/年：月薪中位数 × 发薪月数，
+平台没写月数按 12 薪算），以及 `skills / welfare`（已按下节统一口径，` / ` 分隔），
+在 Excel 里可以直接按年薪或技能排序筛选。
 
 ## 各平台说明
 
@@ -101,15 +133,30 @@ Edge 会往任何用户目录里塞自带组件和缓存（实测 100M+），放
 **风控实测**：Edge 通道下单页请求正常返回 15 条；连续多页/短时间内反复请求会返回
 `code=37 您的环境存在异常`。遇到就停手，隔天再跑，一次一页足够。
 
+## 标签口径统一（技能/福利）
+
+三家平台往"技能"这一列塞的东西完全不一样，直接合并统计会得出"第一名是五险一金"这种结论：
+智联基本只给福利、前程无忧的标签其实是福利、Boss 连学历（大专/本科）和年限（3-5年）都往里放。
+
+`jobstats/skills.py` 在**读取侧**统一一次：大小写与别名归一（`python`/`PYTHON` → `Python`、
+`英文` → `英语`）、同义福利合并（`年终奖`/`年终奖金`、`团建聚餐`/`定期团建`、五险的五个险种
+→ `五险`）、混进技能列的福利词挪回福利列、与 `education`/`experience` 重复的标签丢掉。
+
+入库存的仍是平台原文，所以**改规则不用重采**——历史数据下次读出来就跟着变。
+要加别名就往 `ALIASES` / `WELFARE_ALIASES` 里补一行。
+
 ## 目录结构
 
 ```
 job-stats/
 ├── cli.py                  # 命令行入口
-├── start.bat               # Windows 一键启动 serve
+├── start.bat               # 双击启动筛选台（优先用 .venv）
+├── install.bat             # 双击一键装环境（配合 install.py）
+├── install.py              # 安装流程：建 .venv + 装依赖 + 下内核 + 自检
 ├── jobstats/
 │   ├── config.py           # 限速/额度等合规参数 + 字段白名单
 │   ├── db.py               # SQLite 存储 + 薪资解析 + CSV 导出
+│   ├── skills.py           # 技能/福利标签归一（读取侧，入库仍存原文）
 │   ├── browser.py          # Playwright 会话/登录态/限速/每日额度
 │   ├── report.py           # 统计报告 + 筛选台模板（静态版与服务版共用一套 UI）
 │   ├── server.py           # 本地 Web 服务（页面内采集，仅监听 127.0.0.1）
