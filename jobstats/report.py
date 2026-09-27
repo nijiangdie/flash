@@ -8,6 +8,7 @@ from html import escape as _esc
 from pathlib import Path
 
 from . import db
+from . import skills as tag_rules
 from .config import REPORT_DIR
 
 PLATFORM_NAMES = {"boss": "Boss直聘", "job51": "前程无忧", "zhitong": "智通直聘"}
@@ -42,12 +43,9 @@ def build_stats(records: list[dict]) -> dict:
     cities = Counter(r["city"] for r in records if r.get("city") and r["city"] != "全国")
     experiences = Counter(r["experience"] for r in records if r.get("experience"))
     educations = Counter(r["education"] for r in records if r.get("education"))
-    skills = Counter(
-        s.strip().lower() for r in records for s in (r.get("skills") or []) if s and len(s.strip()) <= 20
-    )
-    welfare = Counter(
-        w for r in records for w in (r.get("welfare") or []) if w
-    )
+    # 清洗是幂等的：库里读出来已经统一过口径，演示数据和外部传入的原文再走一遍
+    skills = Counter(s for r in records for s in tag_rules.clean(r.get("skills")))
+    welfare = Counter(w for r in records for w in tag_rules.welfare(r.get("welfare")))
     industries = Counter(r["industry"] for r in records if r.get("industry"))
 
     # 薪资直方图（千元/月）
@@ -604,13 +602,18 @@ function renderTable(){
 }
 
 function exportCSV(){
-  const head = ['平台','职位','公司','薪资原文','月薪下限K','月薪上限K','城市','经验','学历','技能','链接','采集时间'];
+  const head = ['平台','职位','公司','薪资原文','月薪下限K','月薪上限K','发薪月数','年薪估算万',
+    '城市','经验','学历','技能','福利','链接','采集时间'];
   const lines = [head.join(',')];
   st.filtered.forEach(r => {
     const q = v => `"${String(v??'').replace(/"/g,'""')}"`;
+    const m = mid(r);
     lines.push([PNAME[r.platform]||r.platform, r.title, r.company, r.salary_raw,
-      r.salary_min??'', r.salary_max??'', [r.city,r.district].filter(Boolean).join('·'),
-      r.experience, r.education, (r.skills||[]).join(' '), r.url, r.fetched_at].map(q).join(','));
+      r.salary_min??'', r.salary_max??'', r.salary_months??'',
+      m!==null ? (m*(r.salary_months||12)/10).toFixed(1) : '',
+      [r.city,r.district].filter(Boolean).join('·'),
+      r.experience, r.education, (r.skills||[]).join(' / '), (r.welfare||[]).join(' / '),
+      r.url, r.fetched_at].map(q).join(','));
   });
   const blob = new Blob(['\\ufeff'+lines.join('\\n')], {type:'text/csv;charset=utf-8'});
   const a = document.createElement('a');

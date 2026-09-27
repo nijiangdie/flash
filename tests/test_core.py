@@ -15,7 +15,7 @@ from playwright.sync_api import Error as PlaywrightError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from jobstats import browser, config, db, report
+from jobstats import browser, config, db, report, skills
 from jobstats.collectors import boss
 
 SLOT_NAMES = ("__SUB_LINE__", "__GENERATED_AT__", "__N__", "__DATA__", "__TOKEN__",
@@ -66,6 +66,39 @@ class TestParseSalary(unittest.TestCase):
                 self.assertIsNone(db.parse_salary(raw))
 
 
+class TestSkills(unittest.TestCase):
+    """三家平台往技能列里塞的东西口径不同，读取前必须归一。"""
+
+    def test_casing_and_aliases_unified(self):
+        for raw, want in (("python", "Python"), ("PYTHON", "Python"), ("mysql", "MySQL"),
+                          ("linux", "Linux"), ("英文", "英语"), ("C/C++", "C/C++"),
+                          ("高并发", "高并发")):
+            with self.subTest(raw=raw):
+                self.assertEqual(skills.canonical(raw), want)
+
+    def test_dropped_tags_duplicate_other_columns(self):
+        for raw in ("大专", "本科", "3-5年", "1到3年网络工程师经验", "经验不限",
+                    "在校/应届", "五险一金", "包住", ""):
+            with self.subTest(raw=raw):
+                self.assertEqual(skills.canonical(raw), "")
+
+    def test_clean_dedupes_and_keeps_order(self):
+        self.assertEqual(skills.clean(["Java", "python", "Java", None, "  "]),
+                         ["Java", "Python"])
+
+    def test_clean_is_idempotent(self):
+        once = skills.clean(["python", "大专", "mysql"])
+        self.assertEqual(skills.clean(once), once)
+
+    def test_welfare_synonyms_merged(self):
+        self.assertEqual(skills.welfare(["年终奖", "定期体检", "免费体检", "五险一金"]),
+                         ["年终奖金", "定期体检", "五险一金"])
+
+    def test_welfare_detector_for_tags_smuggled_into_skills(self):
+        self.assertTrue(skills.is_welfare("包吃包住"))
+        self.assertFalse(skills.is_welfare("Python"))
+
+
 class TestSaveJobs(TempDbCase):
     def test_dedup_by_platform_and_job_id(self):
         self.assertEqual(db.save_jobs([make_record()]), 1)
@@ -87,11 +120,13 @@ class TestSaveJobs(TempDbCase):
             db.save_jobs([make_record(candidate_phone="13800000000")])
         self.assertEqual(db.fetch_all(), [])
 
-    def test_skills_and_welfare_round_trip(self):
-        db.save_jobs([make_record()])
+    def test_raw_tags_kept_in_db_and_cleaned_on_read(self):
+        db.save_jobs([make_record(skills=["python", "django", "大专", "五险一金", "3-5年"])])
         row = db.fetch_all()[0]
-        self.assertEqual(row["skills"], ["python", "django"])
-        self.assertEqual(row["welfare"], ["五险一金"])
+        self.assertEqual(row["skills"], ["Python", "Django"])
+        self.assertIn("五险一金", row["welfare"])
+        with db._conn() as c:  # 库里存的仍是平台原文
+            self.assertIn("大专", c.execute("SELECT skills FROM jobs").fetchone()[0])
 
     def test_input_records_not_mutated(self):
         rec = make_record()
@@ -115,6 +150,24 @@ class TestSaveJobs(TempDbCase):
         text = out.read_text(encoding="utf-8-sig")
         self.assertIn("Python开发工程师", text)
         self.assertEqual(len(text.strip().splitlines()), 2)
+
+    def test_csv_export_has_numeric_salary_and_tag_columns(self):
+        db.save_jobs([make_record()])
+        out = Path(db.DB_PATH.parent) / "export.csv"
+        db.export_csv(out)
+        head, line = out.read_text(encoding="utf-8-sig").strip().splitlines()
+        cols = dict(zip(head.split(","), line.split(",")))
+        self.assertEqual(cols["salary_min"], "15.0")
+        self.assertEqual(cols["salary_months"], "14")
+        # 15-25K 中位数 20K × 14 薪 = 28 万/年
+        self.assertEqual(cols["salary_annual_wan"], "28.0")
+        self.assertEqual(cols["skills"], "Python / Django")
+        self.assertEqual(cols["welfare"], "五险一金")
+
+    def test_annual_wan_defaults_to_12_salaries(self):
+        self.assertEqual(db.annual_wan({"salary_min": 10.0, "salary_max": 20.0}), 18.0)
+        self.assertIsNone(db.annual_wan({"salary_min": None, "salary_max": 20.0}))
+        self.assertIsNone(db.annual_wan({"salary_min": 10.0, "salary_max": None}))
 
 
 class TestDailyCap(TempDbCase):
@@ -166,6 +219,15 @@ class TestIsHttp(unittest.TestCase):
 
 
 class TestRenderers(unittest.TestCase):
+    def test_skill_chart_counts_tags_not_welfare(self):
+        """以前第一名是五险一金：混进技能列的福利词不该参与技能排行。"""
+        recs = [make_record(skills=["五险一金", "python"]),
+                make_record(platform_job_id="j2", skills=["包吃包住", "Java"])]
+        stats = report.build_stats(recs)
+        names = [k for k, _ in stats["top_skills"]]
+        self.assertEqual(sorted(names), ["Java", "Python"])
+        self.assertIn("五险一金", dict(stats["top_welfare"]))
+
     def test_stats_report_escapes_cells_and_links(self):
         recs = [make_record(title='<img src=x onerror="alert(1)">', url="javascript:alert(1)")]
         html = report.render(report.build_stats(recs))

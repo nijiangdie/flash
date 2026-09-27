@@ -5,6 +5,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
 
+from . import skills
 from .config import DB_PATH, ALLOWED_FIELDS
 
 # 入库列顺序（fetched_at 由本层统一赋值）
@@ -94,25 +95,47 @@ def count_today() -> int:
 
 
 def fetch_all() -> list[dict]:
+    """读出全部职位，技能/福利按读取侧口径清洗过（库里存的仍是平台原文）。"""
     with _conn() as c:
         rows = c.execute("SELECT * FROM jobs ORDER BY fetched_at DESC").fetchall()
     out = []
     for row in rows:
         d = dict(row)
-        d["skills"] = json.loads(d["skills"] or "[]")
-        d["welfare"] = json.loads(d["welfare"] or "[]")
+        raw_skills = json.loads(d["skills"] or "[]")
+        # 51job/Boss 把福利词塞在技能里，挪回福利列，两边都不丢信息
+        moved = [s for s in raw_skills if skills.is_welfare(s)]
+        d["skills"] = skills.clean(raw_skills)
+        d["welfare"] = skills.welfare(json.loads(d["welfare"] or "[]") + moved)
         out.append(d)
     return out
 
 
+def annual_wan(rec: dict) -> float | None:
+    """年薪估算（万元/年）：月薪中位数 × 发薪月数，平台没写月数按 12 薪算。"""
+    lo, hi = rec.get("salary_min"), rec.get("salary_max")
+    if not lo or not hi:
+        return None
+    return round((lo + hi) / 2 * (rec.get("salary_months") or 12) / 10, 1)
+
+
+# 导出列：数值薪资和年薪放一起，Excel 里能直接排序，也是以后喂给 AI 的字段
+EXPORT_FIELDS = ["platform", "platform_job_id", "title", "company", "salary_raw",
+                 "salary_min", "salary_max", "salary_months", "salary_annual_wan",
+                 "city", "district", "experience", "education", "industry",
+                 "company_scale", "skills", "welfare", "url", "fetched_at"]
+
+
 def export_csv(path):
-    fields = ["platform", "title", "company", "salary_raw", "city", "district",
-              "experience", "education", "industry", "company_scale", "url", "fetched_at"]
-    with _conn() as c, open(path, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f)
-        w.writerow(fields)
-        for row in c.execute(f"SELECT {','.join(fields)} FROM jobs ORDER BY fetched_at DESC"):
-            w.writerow(row)
+    rows = fetch_all()
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=EXPORT_FIELDS)
+        w.writeheader()
+        for r in rows:
+            r["skills"] = " / ".join(r["skills"])
+            r["welfare"] = " / ".join(r["welfare"])
+            r["salary_annual_wan"] = annual_wan(r)
+            w.writerow({k: r.get(k) if r.get(k) is not None else ""
+                        for k in EXPORT_FIELDS})
 
 
 def parse_salary(raw: str):
