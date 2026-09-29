@@ -12,6 +12,8 @@ REPORT_DIR = PROJECT_DIR / "reports"
 DELAY_RANGE = (3.0, 8.0)      # 每次翻页/请求之间的随机间隔（秒）
 MAX_PAGES_DEFAULT = 5          # 单次采集任务的默认页数上限
 DAILY_CAP = 200                # 每天全平台采集职位总量熔断（条）
+# 抓职位正文（JD）是逐条访问详情页，比列表页更容易触发风控，所以单独一个更小的额度。
+DETAIL_DAILY_CAP = 20          # 每天最多抓多少条职位正文
 REQUEST_TIMEOUT_MS = 30000
 
 # ---- 真实浏览器通道（CDP 接管）----
@@ -32,4 +34,10 @@ ALLOWED_FIELDS = {
     "salary_min", "salary_max", "salary_months", "city", "district",
     "experience", "education", "industry", "company_scale",
     "skills", "welfare", "url", "fetched_at",
+}
+
+# 职位正文单独一张表、单独一份白名单：正文很长，混进 jobs 会把筛选台页面撑爆。
+# 同样只允许公开职位内容，HR 姓名/头像/联系方式一类一律不落地。
+ALLOWED_DETAIL_FIELDS = {
+    "platform", "platform_job_id", "description", "keyword_tags", "url", "fetched_at",
 }

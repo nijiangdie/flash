@@ -128,3 +128,12 @@ def collect(query: str, city: str = "全国", max_pages: int = MAX_PAGES_DEFAULT
     records = list(all_jobs.values())[:daily_remaining]
     print(f"[job51] 本次去重后采集 {len(records)} 条")
     return records
+
+
+def fetch_detail(job: dict) -> dict | None:
+    """前程无忧的详情页拿不到正文：实测（2026-09-27）从列表点进去直接弹滑块验证。
+
+    按红线"遇到验证即停、不绕"，这里刻意一个请求都不发。正文请用智通或 Boss。
+    """
+    print("  前程无忧详情页要求滑块验证，按合规红线不抓正文（请改用智通或 Boss）。")
+    return None

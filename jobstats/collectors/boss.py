@@ -6,6 +6,7 @@ import re
 
 from playwright.sync_api import Error as PlaywrightError
 
+from .. import html_text
 from ..browser import (polite_sleep, check_daily_cap, attach, cdp_alive, open_edge,
                        interactive_login, login_with_edge)
 from ..config import AUTH_DIR, MAX_PAGES_DEFAULT
@@ -131,6 +132,26 @@ class Channel:
             f"Boss 通道反复中断（{last}）。采集期间请把那个 Edge 窗口保持打开；"
             "如果它总是自己退出，先关掉所有 Edge 窗口再运行 python cli.py login boss --edge。")
 
+    def get_html(self, url: str) -> str | None:
+        """取详情页 HTML。和搜索接口一样只借登录 cookie，不开标签页。"""
+        last = ""
+        for _ in range(self._retries):
+            try:
+                with self._attach() as ctx:
+                    resp = ctx.request.get(
+                        url, headers={"Referer": SEARCH_URL,
+                                      "Accept": "text/html,application/xhtml+xml,"
+                                               "application/xml;q=0.9,*/*;q=0.8"})
+                    if resp.status != 200:
+                        print(f"  详情页返回 HTTP {resp.status}，跳过这条。")
+                        return None
+                    return resp.text()
+            except (PlaywrightError, RuntimeError) as e:
+                last = _first_line(e)
+                print(f"  Edge 通道中断（{last}），重新接管后重试这条。")
+        raise RuntimeError(
+            f"Boss 通道反复中断（{last}）。抓取期间请把那个 Edge 窗口保持打开。")
+
 
 def _harvest(channel: Channel, query: str, city: str, city_code: str,
              max_pages: int, daily_remaining: int) -> dict[str, dict]:
@@ -188,3 +209,40 @@ def collect(query: str, city: str = "全国", max_pages: int = MAX_PAGES_DEFAULT
             "或重新运行 python cli.py login boss --edge 刷新登录。")
     print(f"[boss] 本次去重后采集 {len(records)} 条")
     return records
+
+
+# ---- 职位正文 ----
+# 实测：详情页的正文是服务端渲染的，用登录态直接 GET 这个 URL 就能拿到，
+# 不需要开标签页（开页面反而更容易碰风控）。
+_DESC_RE = re.compile(r'<div class="job-sec-text"[^>]*>(.*?)</div>', re.S)
+_KEYWORDS_RE = re.compile(r'<ul class="job-keyword-list"[^>]*>(.*?)</ul>', re.S)
+_VERIFY_WORDS = ("滑动验证", "访问验证", "安全验证", "请输入验证码")
+
+
+def parse_detail(body: str) -> dict:
+    """把详情页 HTML 解析成正文 + 关键词（纯函数，便于离线测试）。"""
+    m = _DESC_RE.search(body)
+    km = _KEYWORDS_RE.search(body)
+    # 这段不是 <pre>，源码换行只是排版；换行只认 <br/>
+    return {"description": html_text.to_lines(m.group(1), keep_blanks=False) if m else "",
+            "keyword_tags": html_text.list_items(km.group(1)) if km else []}
+
+
+def fetch_detail(job: dict, channel: Channel | None = None) -> dict | None:
+    url = job.get("url") or ""
+    if not url:
+        print("  这条没有详情页链接，跳过。")
+        return None
+    body = (channel or Channel()).get_html(url)
+    if body is None:
+        return None
+    parsed = parse_detail(body)
+    if not parsed["description"]:
+        if any(w in body for w in _VERIFY_WORDS):
+            raise RuntimeError(
+                "Boss 详情页弹出了人机验证，按合规红线本次立刻停止抓正文。"
+                "请隔天再试，或先用智通（zhitong，无需浏览器）抓正文。")
+        print("  详情页没解析出正文（职位已下架，或页面结构变了）。")
+        return None
+    return dict(parsed, platform=job["platform"],
+                platform_job_id=job["platform_job_id"], url=url)

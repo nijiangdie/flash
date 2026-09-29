@@ -6,6 +6,9 @@
 
 - 本工具**只采集公开职位信息**（职位名/薪资/公司/城市/技能标签），**不采集**任何简历、联系方式等个人信息
 - 内置限速：每次翻页随机间隔 3~8 秒；每日采集总量熔断 200 条（`jobstats/config.py` 中可查）
+- 职位正文（JD）要逐条打开详情页，额度单独算且更小：**每天 20 条**（`DETAIL_DAILY_CAP`）
+- 投递状态/备注（`status`/`note`）是**你在这台机器上自己标的**，不来自平台，也不会拿你的
+  登录状态去平台查"HR 有没有已读"这类私域数据
 - 数据**只存你本地** SQLite，不上传、不分发；请勿用于商业再分发
 - 如遇平台验证码/风控提示，**立即停止**，隔天再试。请勿调高频率、请勿多开
 
@@ -78,14 +81,60 @@ python cli.py browse --demo
 # 附：导出 CSV（Excel 可直接打开）
 python cli.py export
 python cli.py export --out 我的投递清单.csv
+
+# 附：给要投的那几条抓职位正文（JD），逐条打开详情页
+python cli.py detail --ids 562,560              # 库里 id（CSV 第一列 platform_job_id 对应的那条）
+python cli.py detail --platform zhitong --limit 5   # 自动挑还没正文的职位补抓
 ```
 
 一次采集建议一天跑 1~2 个关键词即可，多跑几天数据自然积累。
 
-导出的 19 列里，除了平台原文的 `salary_raw`，还给了 `salary_min / salary_max /
+导出的 22 列里，除了平台原文的 `salary_raw`，还给了 `salary_min / salary_max /
 salary_months / salary_annual_wan`（年薪估算，万元/年：月薪中位数 × 发薪月数，
 平台没写月数按 12 薪算），以及 `skills / welfare`（已按下节统一口径，` / ` 分隔），
-在 Excel 里可以直接按年薪或技能排序筛选。
+在 Excel 里可以直接按年薪或技能排序筛选。`description` 是职位正文，只有抓过的
+那条才有值（见下节）；`status / note` 是你自己标的投递进度（见「投递状态」一节）。
+
+## 职位正文（JD）
+
+统计口径只能告诉你"市场给多少钱"，投递时要看具体那条 JD 写了什么要求。所以正文
+单独一张表 `job_details`，**默认不去抓**——逐条打开详情页比翻列表页容易触发风控得多。
+
+- **每日额度单独算**：`DETAIL_DAILY_CAP = 20` 条/天，抓满就熔断，和列表额度互不影响。
+  每抓一条照样随机等 3~8 秒。
+- **怎么看**：筛选台每行末尾的『抓正文 / 看正文』按钮，点开在这行下方展开；
+  或 `python cli.py detail --ids …`；或导出 CSV 看 `description` 列。
+- **哪些平台抓得到**（2026-09-27 实测）：
+  | 平台 | 正文 | 说明 |
+  |---|---|---|
+  | 智通直聘 | ✅ 纯 HTTP | 正文在 `<pre class="pos-desc">` 里原样带换行，连浏览器都不用开 |
+  | Boss直聘 | ✅ 走 Edge 通道 | 正文在 `<div class="job-sec-text">`，用登录上下文直接 GET 详情页即可，不开标签页 |
+  | 前程无忧 | ❌ 不抓 | 详情页 `jobs.51job.com/...` 直接弹滑块验证，按红线立刻停手，代码里一个请求都不发 |
+- **只存公开内容**：正文和详情页关键词（`keyword_tags`）进白名单
+  `ALLOWED_DETAIL_FIELDS`，HR 姓名/头像/联系方式那一段压根不解析。
+- 同一职位重复抓会**覆盖**旧正文（招聘方会改 JD）；页面按钮只在没有正文时才发请求，
+  想重抓用 `python cli.py detail --ids … --force`。
+- 详情页关键词比列表页更全（智通列表页技能列常是空的），但只存在 `job_details` 里，
+  不会自动并进 `jobs.skills`，统计口径仍以列表页为准。
+
+## 投递状态（本地标注）
+
+采回来 180 条之后，真正的问题变成"我投了哪几条、哪条约了面"。所以 `jobs` 表另有两列
+`status`（想投 / 已投 / HR已读 / 约面 / 已面 / offer / 不合适）和 `note`（备注，200 字以内）。
+
+- **怎么用**：筛选台每行的『状态』下拉选一下，旁边备注框写一句（**失焦或回车才存**，
+  框子绿一下边框就是存好了）。筛选条上的『状态』下拉里选**未标注**，就是"还有哪些没处理"，
+  用它挑下一批要投的。
+- **它不访问任何平台**：这两列记录的是你自己做过的动作。刻意**不**去做"从 Boss 同步
+  HR 是否已读"那种功能——那要用你的登录会话去读私域沟通数据，超出采集红线，也不稳定。
+- **采集器写不进这两列**：`status/note` 不在 `ALLOWED_FIELDS` 白名单里，唯一的写入口是
+  `db.set_status()`。同一个关键词反复重采也不会把你标过的状态冲掉（入库走的是
+  `INSERT OR IGNORE`，已存在的行整行跳过）。
+- **老库自动补列**：`init_db()` 会先查 `PRAGMA table_info(jobs)` 再 `ALTER TABLE` 补这两列，
+  已有的职位一条不动，老行的状态读出来是空字符串。
+- 导出 CSV（`python cli.py export`，22 列）和页面上的『导出当前结果 CSV』都带上这两列，
+  在 Excel 里按 `status` 一排序就是一份投递台账。
+
 
 ## 各平台说明
 
@@ -155,15 +204,17 @@ job-stats/
 ├── install.py              # 安装流程：建 .venv + 装依赖 + 下内核 + 自检
 ├── jobstats/
 │   ├── config.py           # 限速/额度等合规参数 + 字段白名单
-│   ├── db.py               # SQLite 存储 + 薪资解析 + CSV 导出
+│   ├── db.py               # SQLite 存储 + 薪资解析 + 职位正文表 + CSV 导出
 │   ├── skills.py           # 技能/福利标签归一（读取侧，入库仍存原文）
+│   ├── html_text.py        # 详情页 HTML 片段 → 纯文本（保住换行）
+│   ├── details.py          # 逐条抓正文的调度：单独每日额度 + 限速 + 遇验证即停
 │   ├── browser.py          # Playwright 会话/登录态/限速/每日额度
 │   ├── report.py           # 统计报告 + 筛选台模板（静态版与服务版共用一套 UI）
-│   ├── server.py           # 本地 Web 服务（页面内采集，仅监听 127.0.0.1）
+│   ├── server.py           # 本地 Web 服务（页面内采集/看正文，仅监听 127.0.0.1）
 │   └── collectors/
-│       ├── boss.py         # Boss直聘采集器
-│       ├── job51.py        # 前程无忧采集器
-│       └── zhitong.py      # 智通直聘采集器（纯 HTTP，不用浏览器）
+│       ├── boss.py         # Boss直聘采集器（含详情页正文）
+│       ├── job51.py        # 前程无忧采集器（详情页要滑块验证，不抓正文）
+│       └── zhitong.py      # 智通直聘采集器（纯 HTTP，不用浏览器，含正文）
 ├── tests/                  # 单元测试：python -m unittest discover -s tests
 ├── data/                   # 数据库 + 登录态（自动生成，勿外传；Boss 的浏览器配置在 %LOCALAPPDATA%）
 └── reports/                # 生成的 HTML

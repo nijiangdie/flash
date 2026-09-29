@@ -276,8 +276,9 @@ def _demo_records() -> list[dict]:
 # 职位筛选台模板。静态版（cli.py browse 产出的单文件）与服务版（cli.py serve）
 # 共用同一套 UI；采集面板、轮询脚本只在服务版注入，改筛选界面只需改这里一处。
 #
-# 槽位：__SUB_LINE__ __GENERATED_AT__ __N__ __DATA__ __TOKEN__
-#       __COLLECT_PANEL__ __COLLECT_SCRIPT__ __BOOT_HOOK__ __CITY_OPTIONS__
+# 槽位：__SUB_LINE__ __GENERATED_AT__ __N__ __DATA__ __TOKEN__ __IS_WEB__ __STATUS_CONSTS__
+#       __COLLECT_PANEL__ __COLLECT_SCRIPT__ __DETAIL_SCRIPT__ __DETAIL_TH__
+#       __STATUS_SCRIPT__ __BOOT_HOOK__ __CITY_OPTIONS__
 # ---------------------------------------------------------------------------
 FILTER_TEMPLATE = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -331,6 +332,14 @@ FILTER_TEMPLATE = """<!DOCTYPE html>
   .legend { font-size:11px; color:var(--muted); display:flex; gap:14px; margin-top:6px; }
   .legend i { display:inline-block; width:8px; height:8px; border-radius:2px; margin-right:4px; }
   #c-log { font-family:Consolas,"Courier New",monospace; }
+  tr.det-row td { background:#fcfdfe; }
+  .det-wrap { background:#fafbfc; border:1px solid var(--border); border-radius:8px;
+              padding:10px 12px; max-height:420px; overflow:auto; }
+  .det-wrap pre { white-space:pre-wrap; word-break:break-word; font-family:inherit;
+                  font-size:13px; line-height:1.75; margin-top:6px; }
+  select.st { width:92px; }
+  input.st-note { width:150px; margin-top:4px; display:block; }
+  .st-saved { border-color:#00b578; }
 </style>
 </head>
 <body>
@@ -368,6 +377,11 @@ __COLLECT_PANEL__
     <span id="exp-chips"></span>
   </div>
   <div class="row">
+    <span class="grp-lbl">状态</span>
+    <select id="f-status"></select>
+    <span class="hint">状态是你自己标的投递进度，只写本地，不会去平台查任何东西</span>
+  </div>
+  <div class="row">
     <span class="grp-lbl">排序</span>
     <select id="f-sort">
       <option value="latest">最新采集</option>
@@ -389,7 +403,7 @@ __COLLECT_PANEL__
 <div class="card">
   <table>
     <thead><tr><th>平台</th><th>职位</th><th>公司</th><th>薪资</th><th>城市</th>
-    <th>经验</th><th>学历</th><th>技能标签</th><th>采集时间</th></tr></thead>
+    <th>经验</th><th>学历</th><th>技能标签</th><th>采集时间</th><th>状态</th>__DETAIL_TH__</tr></thead>
     <tbody id="tbody"></tbody>
   </table>
   <div class="pager">
@@ -401,12 +415,14 @@ __COLLECT_PANEL__
 
 <script>
 let DATA = __DATA__;
+const WEB = __IS_WEB__;
+__STATUS_CONSTS__
 const PNAME = {boss:'Boss直聘', job51:'前程无忧', zhitong:'智通直聘'};
 const PAGE_SIZE = 20;
 const TOKEN = '__TOKEN__';
 const PRESETS = [['不限',null,null],['≤10K',null,10],['10-20K',10,20],['20-30K',20,30],['≥30K',30,null]];
 const st = { plat:new Set(), city:'', edu:new Set(), exp:new Set(), kw:'',
-             smin:null, smax:null, sort:'latest', page:1, filtered:[] };
+             smin:null, smax:null, sort:'latest', status:'', page:1, filtered:[] };
 
 const uniq = a => [...new Set(a.filter(Boolean))];
 const esc = s => String(s??'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -432,6 +448,12 @@ function buildUI(){
   document.getElementById('f-city').innerHTML =
     `<option value="">全部城市</option>` + cities.map(c=>`<option>${esc(c)}</option>`).join('');
   document.getElementById('f-city').onchange = e => { st.city=e.target.value; st.page=1; apply(); };
+
+  // 投递状态（"未标注"= 还没标过的，用来挑下一步投哪些）
+  document.getElementById('f-status').innerHTML =
+    `<option value="">全部状态</option><option value="__none__">未标注</option>` +
+    STATUS.filter(Boolean).map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
+  document.getElementById('f-status').onchange = e => { st.status=e.target.value; st.page=1; apply(); };
 
   // 学历/经验 chips（按数量排序，可多选）
   const chip = (arr, key, box, attr) => {
@@ -480,6 +502,7 @@ function buildUI(){
 function syncUI(){
   document.querySelectorAll('[data-plat]').forEach(b => b.classList.toggle('on', st.plat.has(b.dataset.plat)));
   document.getElementById('f-city').value = st.city;
+  document.getElementById('f-status').value = st.status;
   document.querySelectorAll('[data-edu]').forEach(b => b.classList.toggle('on', st.edu.has(b.dataset.edu)));
   document.querySelectorAll('[data-exp]').forEach(b => b.classList.toggle('on', st.exp.has(b.dataset.exp)));
   document.getElementById('f-smin').value = st.smin??'';
@@ -499,6 +522,7 @@ function apply(){
     if (st.city && r.city !== st.city) return false;
     if (st.edu.size && !st.edu.has(r.education)) return false;
     if (st.exp.size && !st.exp.has(r.experience)) return false;
+    if (st.status && (r.status || '') !== (st.status === '__none__' ? '' : st.status)) return false;
     if (st.smin!==null || st.smax!==null){
       const m = mid(r);
       if (m===null) return false;
@@ -526,6 +550,7 @@ function renderActiveTags(){
   if (st.city) tags.push({k:'city', v:st.city, t:'城市: '+st.city});
   st.edu.forEach(v => tags.push({k:'edu', v, t:'学历: '+v}));
   st.exp.forEach(v => tags.push({k:'exp', v, t:'经验: '+v}));
+  if (st.status) tags.push({k:'status', v:'', t:'状态: ' + (st.status==='__none__'?'未标注':st.status)});
   if (st.smin!==null || st.smax!==null){
     const t = '月薪: ' + (st.smin??'') + ' ~ ' + (st.smax??'') + 'K';
     tags.push({k:'salary', v:'', t});
@@ -541,6 +566,7 @@ function renderActiveTags(){
 function removeFilter(k, v){
   if (k==='plat'){ st.plat.delete(v); const el=document.querySelector(`[data-plat="${v}"]`); el&&el.classList.remove('on'); }
   else if (k==='city'){ st.city=''; document.getElementById('f-city').value=''; }
+  else if (k==='status'){ st.status=''; document.getElementById('f-status').value=''; }
   else if (k==='edu'){ st.edu.delete(v); const el=document.querySelector(`[data-edu="${CSS.escape(v)}"]`); el&&el.classList.remove('on'); }
   else if (k==='exp'){ st.exp.delete(v); const el=document.querySelector(`[data-exp="${CSS.escape(v)}"]`); el&&el.classList.remove('on'); }
   else if (k==='salary'){ st.smin=st.smax=null;
@@ -558,7 +584,7 @@ function renderStats(){
   document.getElementById('s-range').textContent = mids.length
     ? Math.round(Math.min(...mids)) + ' ~ ' + Math.round(Math.max(...mids)) : '—';
   document.getElementById('s-city').textContent = uniq(rs.map(r=>r.city)).length;
-  const active = st.plat.size + (st.city?1:0) + st.edu.size + st.exp.size
+  const active = st.plat.size + (st.city?1:0) + st.edu.size + st.exp.size + (st.status?1:0)
     + ((st.smin!==null||st.smax!==null)?1:0) + (st.kw?1:0);
   document.getElementById('filter-hint').textContent =
     active ? `已启用 ${active} 个筛选条件` : '未启用筛选，显示全部数据';
@@ -588,22 +614,32 @@ function renderTable(){
     const u = safeUrl(r.url);
     const title = u ? `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(r.title)}</a>` : esc(r.title);
     const tags = (r.skills||[]).slice(0,6).map(s=>`<span class="tag">${esc(s)}</span>`).join('');
+    const det = WEB ? `<td><button class="chip" data-det="1" data-id="${esc(r.id)}"
+      data-key="${esc(detKey(r))}">${DET.has(detKey(r)) ? '看正文' : '抓正文'}</button></td>` : '';
+    const stCell = WEB ? `<td>
+      <select class="st" data-st="${esc(r.id)}">${STATUS.map(s =>
+        `<option value="${esc(s)}"${(r.status||'')===s?' selected':''}>${esc(s||'未标注')}</option>`
+      ).join('')}</select>
+      <input type="text" class="st-note" data-note="${esc(r.id)}" placeholder="记一句"
+        maxlength="${NOTE_MAX}" value="${esc(r.note||'')}"></td>`
+      : `<td>${esc(r.status||'—')}</td>`;
     return `<tr>
       <td><span class="plat-badge p-${r.platform}">${PNAME[r.platform]||r.platform}</span></td>
       <td>${title}</td><td>${esc(r.company)}</td><td>${sal}</td>
       <td>${esc([r.city,r.district].filter(Boolean).join('·'))}</td>
       <td>${esc(r.experience||'—')}</td><td>${esc(r.education||'—')}</td>
-      <td>${tags||'—'}</td><td class="hint">${esc(r.fetched_at)}</td></tr>`;
+      <td>${tags||'—'}</td><td class="hint">${esc(r.fetched_at)}</td>${stCell}${det}</tr>`;
   }).join('');
   document.getElementById('tbody').innerHTML = rows
-    || `<tr><td colspan="9" class="hint" style="text-align:center;padding:30px">没有符合筛选条件的职位，试试放宽条件</td></tr>`;
+    || `<tr><td colspan="${WEB?11:10}" class="hint" style="text-align:center;padding:30px">没有符合筛选条件的职位，试试放宽条件</td></tr>`;
+  if (WEB) { bindDetails(); bindStatus(); }
   document.getElementById('pg-info').textContent = rs.length
     ? `第 ${st.page}/${max} 页 · 共 ${rs.length} 条` : '';
 }
 
 function exportCSV(){
   const head = ['平台','职位','公司','薪资原文','月薪下限K','月薪上限K','发薪月数','年薪估算万',
-    '城市','经验','学历','技能','福利','链接','采集时间'];
+    '城市','经验','学历','技能','福利','状态','备注','链接','采集时间'];
   const lines = [head.join(',')];
   st.filtered.forEach(r => {
     const q = v => `"${String(v??'').replace(/"/g,'""')}"`;
@@ -613,7 +649,7 @@ function exportCSV(){
       m!==null ? (m*(r.salary_months||12)/10).toFixed(1) : '',
       [r.city,r.district].filter(Boolean).join('·'),
       r.experience, r.education, (r.skills||[]).join(' / '), (r.welfare||[]).join(' / '),
-      r.url, r.fetched_at].map(q).join(','));
+      r.status||'', r.note||'', r.url, r.fetched_at].map(q).join(','));
   });
   const blob = new Blob(['\\ufeff'+lines.join('\\n')], {type:'text/csv;charset=utf-8'});
   const a = document.createElement('a');
@@ -622,7 +658,7 @@ function exportCSV(){
   a.click();
 }
 
-__COLLECT_SCRIPT__buildUI();
+__COLLECT_SCRIPT____DETAIL_SCRIPT____STATUS_SCRIPT__buildUI();
 apply();__BOOT_HOOK__
 </script>
 </body>
@@ -763,9 +799,125 @@ async function resumeTask(){
 
 """
 
+DETAIL_TH = "<th>正文</th>"
+
+STATUS_JS = """// ---- 投递状态：只是把"我投没投、面得怎么样"记在本地库，不发任何平台请求 ----
+function bindStatus(){
+  document.querySelectorAll('[data-st]').forEach(sel =>
+    sel.onchange = () => saveStatus(sel.dataset.st, 'status', sel.value));
+  // 备注用 change（失焦或回车才存），避免每敲一个字就写一次库
+  document.querySelectorAll('[data-note]').forEach(inp =>
+    inp.onchange = () => saveStatus(inp.dataset.note, 'note', inp.value));
+}
+
+async function saveStatus(id, key, value){
+  const el = document.querySelector(`[data-${key === 'status' ? 'st' : 'note'}="${id}"]`);
+  el.classList.add('st-saved');
+  try {
+    const r = await api('/api/status', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: +id, [key]: value})});
+    const row = DATA.find(x => String(x.id) === String(id));
+    if (row) row[key] = r[key] === undefined ? '' : r[key];   // 用服务端裁过的长度回填
+    el.title = '';
+  } catch (e) {
+    el.title = '没存上：' + e.message;
+  } finally {
+    setTimeout(() => el.classList.remove('st-saved'), 1200);
+  }
+}
+
+"""
+
+DETAIL_JS = """// ---- 职位正文（JD）：逐条打开详情页，走本地服务，受每日正文额度约束 ----
+const DET = new Set();        // 已有正文的职位键：platform:job_id
+const DET_CACHE = {};         // 键 -> 正文对象，展开过就不重复请求
+let detBusy = false;          // 一次只放一条详情请求出去
+
+const detKey = r => r.platform + ':' + r.platform_job_id;
+
+async function loadDetailKeys(){
+  try {
+    const r = await api('/api/details');
+    (r.keys || []).forEach(k => DET.add(k));
+    renderTable();
+  } catch (e) {}
+}
+
+function bindDetails(){
+  document.querySelectorAll('[data-det]').forEach(b => {
+    b.onclick = () => toggleDetail(b);
+  });
+}
+
+function renderDetail(cell, d, note){
+  cell.innerHTML = '';
+  const box = document.createElement('div');
+  box.className = 'det-wrap';
+  const head = document.createElement('div');
+  head.className = 'hint';
+  head.textContent = (d.fetched_at ? '正文抓取于 ' + d.fetched_at : '')
+    + (note ? ' · ' + note : '');
+  box.appendChild(head);
+  if ((d.keyword_tags || []).length) {
+    const line = document.createElement('div');
+    d.keyword_tags.forEach(t => {
+      const s = document.createElement('span');
+      s.className = 'tag'; s.textContent = t; line.appendChild(s);
+    });
+    box.appendChild(line);
+  }
+  const pre = document.createElement('pre');
+  pre.textContent = d.description || '（这条没解析出正文）';
+  box.appendChild(pre);
+  cell.appendChild(box);
+}
+
+async function toggleDetail(btn){
+  const tr = btn.closest('tr');
+  const next = tr.nextElementSibling;
+  if (next && next.classList.contains('det-row')) { next.remove(); return; }
+  document.querySelectorAll('tr.det-row').forEach(x => x.remove());
+  const row = document.createElement('tr');
+  row.className = 'det-row';
+  const cell = document.createElement('td');
+  cell.colSpan = 11;
+  row.appendChild(cell);
+  tr.after(row);
+  await showDetail(btn, cell);
+}
+
+async function showDetail(btn, cell){
+  const key = btn.dataset.key;
+  if (DET_CACHE[key]) { renderDetail(cell, DET_CACHE[key]); return; }
+  if (detBusy) { cell.textContent = '上一条正文还在处理，稍等几秒再点。'; return; }
+  detBusy = true;
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = '正文抓取中…';
+  cell.textContent = DET.has(key) ? '正在读取本地正文…' : '正在打开详情页抓正文，约几秒…';
+  try {
+    const r = await api('/api/detail', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: +btn.dataset.id})});
+    if (!r.ok || !r.detail) throw new Error(r.error || '这条没拿到正文');
+    DET_CACHE[key] = r.detail; DET.add(key);
+    renderDetail(cell, r.detail, r.note || '');
+    btn.textContent = '收起正文';
+  } catch (e) {
+    cell.textContent = e.message;
+    btn.textContent = label;
+  } finally {
+    detBusy = false; btn.disabled = false;
+  }
+}
+
+"""
+
 SLOT_RE = re.compile("|".join(map(re.escape, (
-    "__COLLECT_PANEL__", "__COLLECT_SCRIPT__", "__CITY_OPTIONS__", "__GENERATED_AT__",
-    "__SUB_LINE__", "__BOOT_HOOK__", "__TOKEN__", "__DATA__", "__N__"))))
+    "__COLLECT_PANEL__", "__COLLECT_SCRIPT__", "__DETAIL_SCRIPT__", "__STATUS_SCRIPT__",
+    "__STATUS_CONSTS__", "__CITY_OPTIONS__",
+    "__GENERATED_AT__", "__SUB_LINE__", "__BOOT_HOOK__", "__TOKEN__", "__DATA__",
+    "__N__", "__IS_WEB__", "__DETAIL_TH__"))))
 
 
 def _filter_html(sub_line: str, records: list[dict], *, web: bool,
@@ -781,7 +933,13 @@ def _filter_html(sub_line: str, records: list[dict], *, web: bool,
         "__CITY_OPTIONS__": city_opts_html,
         "__COLLECT_PANEL__": WEB_COLLECT_PANEL.replace("__CITY_OPTIONS__", city_opts_html) if web else "",
         "__COLLECT_SCRIPT__": WEB_COLLECT_SCRIPT if web else "",
-        "__BOOT_HOOK__": "\nresumeTask();" if web else "",
+        "__DETAIL_SCRIPT__": DETAIL_JS if web else "",
+        "__DETAIL_TH__": DETAIL_TH if web else "",
+        "__STATUS_SCRIPT__": STATUS_JS if web else "",
+        "__STATUS_CONSTS__": "const STATUS = {}; const NOTE_MAX = {};".format(
+            _embed_json(list(db.STATUS_LABELS)), db.NOTE_MAX),
+        "__IS_WEB__": "true" if web else "false",
+        "__BOOT_HOOK__": "\nresumeTask(); loadDetailKeys();" if web else "",
     }
     # 单次扫描替换：值里若含占位符字面量也不会被二次展开
     return re.sub(SLOT_RE, lambda m: slots[m.group(0)], FILTER_TEMPLATE)

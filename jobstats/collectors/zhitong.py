@@ -14,6 +14,7 @@ import urllib.parse
 import urllib.request
 
 from .. import db
+from .. import html_text
 from ..browser import polite_sleep, check_daily_cap
 from ..config import MAX_PAGES_DEFAULT, REQUEST_TIMEOUT_MS
 
@@ -172,3 +173,36 @@ def collect(query: str, city: str = "东莞", max_pages: int = MAX_PAGES_DEFAULT
     records = list(all_jobs.values())[:daily_remaining]
     print(f"[zhitong] 本次去重后采集 {len(records)} 条")
     return records
+
+
+# ---- 职位正文 ----
+# 详情页同样是服务端渲染：正文在 <pre class="common-text-desc pos-desc"> 里原样带着换行，
+# 公司简介用的是 com-desc 类名，靠 pos-desc 区分开。
+_DESC_RE = re.compile(r'<pre class="[^"]*\bpos-desc\b[^"]*"[^>]*>(.*?)</pre>', re.S)
+_KEYWORDS_RE = re.compile(r'<ul class="keyword-tags[^"]*">(.*?)</ul>', re.S)
+
+
+def parse_detail(body: str) -> dict:
+    """把详情页 HTML 解析成正文 + 关键词（纯函数，便于离线测试）。"""
+    m = _DESC_RE.search(body)
+    km = _KEYWORDS_RE.search(body)
+    return {"description": html_text.to_lines(m.group(1)) if m else "",
+            "keyword_tags": html_text.list_items(km.group(1)) if km else []}
+
+
+def fetch_detail(job: dict) -> dict | None:
+    url = job.get("url") or ""
+    if not url:
+        print("  这条没有详情页链接，跳过。")
+        return None
+    try:
+        body = _fetch(url)
+    except Exception as e:
+        print(f"  详情页获取失败: {str(e)[:90]}")
+        return None
+    parsed = parse_detail(body)
+    if not parsed["description"]:
+        print("  详情页没解析出正文（职位可能已下架，或页面结构变了）。")
+        return None
+    return dict(parsed, platform=job["platform"],
+                platform_job_id=job["platform_job_id"], url=url)

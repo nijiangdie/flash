@@ -12,9 +12,9 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import db, report
+from . import db, details, report
 from .collectors import boss, job51, zhitong
-from .config import DAILY_CAP, MAX_PAGES_DEFAULT
+from .config import DAILY_CAP, DETAIL_DAILY_CAP, MAX_PAGES_DEFAULT
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -175,6 +175,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": False, "error": "安全校验失败"}, 403)
         if path == "/api/jobs":
             return self._json({"ok": True, "jobs": db.fetch_all()})
+        if path == "/api/details":
+            return self._json({"ok": True, "keys": db.detail_keys()})
         if path == "/api/collect/current":
             tid = self.manager.current_id()
             task = self.manager.get(tid) if tid else None
@@ -187,7 +189,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?")[0]
-        if path != "/api/collect":
+        if path not in ("/api/collect", "/api/detail", "/api/status"):
             return self._json({"ok": False, "error": "404"}, 404)
         if not self._check_token():
             return self._json({"ok": False, "error": "安全校验失败"}, 403)
@@ -197,6 +199,11 @@ class Handler(BaseHTTPRequestHandler):
                 .decode("utf-8") or "{}")
         except Exception:
             return self._json({"ok": False, "error": "请求体不是合法 JSON"}, 400)
+
+        if path == "/api/detail":
+            return self._detail(body)
+        if path == "/api/status":
+            return self._status(body)
 
         platform = body.get("platform")
         query = (body.get("query") or "").strip()
@@ -221,6 +228,55 @@ class Handler(BaseHTTPRequestHandler):
         if err:
             return self._json({"ok": False, "error": err}, 409)
         return self._json({"ok": True, "task": task.snapshot()})
+
+    def _detail(self, body: dict):
+        """读一条职位的正文；本地没有就现抓这一条（受每日正文额度熔断）。"""
+        try:
+            job_id = int(body.get("id"))
+        except (TypeError, ValueError):
+            return self._json({"ok": False, "error": "缺少职位行号"}, 400)
+        rows = db.jobs_by_ids([job_id])
+        if not rows:
+            return self._json({"ok": False, "error": "库里找不到这条职位"}, 404)
+        job = rows[0]
+        key = (job["platform"], job["platform_job_id"])
+        stored = db.get_detail(*key)
+        if stored:
+            return self._json({"ok": True, "detail": stored})
+        if self.manager.current_id():
+            return self._json({"ok": False, "error": "采集任务正在运行，先等它结束再抓正文。"},
+                              409)
+        try:
+            res = details.collect_details([job])
+        except RuntimeError as e:
+            return self._json({"ok": False, "error": str(e)}, 400)
+        stored = db.get_detail(*key)
+        if not stored:
+            return self._json({"ok": False, "error":
+                               "这条没拿到正文：职位可能已下架，或平台要求人机验证（此时已立刻停手）。"},
+                              400)
+        return self._json({"ok": True, "detail": stored,
+                           "note": f"今日正文还能抓 {res['left']} 条"})
+
+    def _status(self, body: dict):
+        """标注一条职位的投递进度：只写本地的状态/备注两列，不发任何平台请求。"""
+        try:
+            job_id = int(body.get("id"))
+        except (TypeError, ValueError):
+            return self._json({"ok": False, "error": "缺少职位行号"}, 400)
+        status = body.get("status")
+        note = body.get("note")
+        if status is None and note is None:
+            return self._json({"ok": False, "error": "没说要改什么"}, 400)
+        if not isinstance(status, (str, type(None))) or not isinstance(note, (str, type(None))):
+            return self._json({"ok": False, "error": "状态和备注得是文字"}, 400)
+        try:
+            saved = db.set_status(job_id, status, note)
+        except ValueError as e:
+            return self._json({"ok": False, "error": str(e)}, 400)
+        if saved is None:
+            return self._json({"ok": False, "error": "库里找不到这条职位"}, 404)
+        return self._json(dict(ok=True, **saved))
 
     # ---- 页面 ----
     def _page(self):
@@ -251,7 +307,9 @@ def serve(port: int = DEFAULT_PORT, open_browser: bool = True):
             f"python cli.py serve --port {port + 1}")
     url = f"http://{HOST}:{port}"
     print(f"职位筛选台已启动：{url}")
-    print(f"今日已入库 {db.count_today()} 条（每日额度 {DAILY_CAP} 条），Ctrl+C 停止服务。")
+    print(f"今日已入库 {db.count_today()} 条（每日额度 {DAILY_CAP} 条），"
+          f"正文已抓 {db.count_details_today()} 条（每日额度 {DETAIL_DAILY_CAP} 条）。")
+    print("Ctrl+C 停止服务。")
     if open_browser:
         import webbrowser
         webbrowser.open(url)

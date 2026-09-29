@@ -15,11 +15,13 @@ from playwright.sync_api import Error as PlaywrightError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from jobstats import browser, config, db, report, skills
+from jobstats import browser, config, db, details, html_text, report, skills
 from jobstats.collectors import boss
 
 SLOT_NAMES = ("__SUB_LINE__", "__GENERATED_AT__", "__N__", "__DATA__", "__TOKEN__",
-              "__CITY_OPTIONS__", "__COLLECT_PANEL__", "__COLLECT_SCRIPT__", "__BOOT_HOOK__")
+              "__CITY_OPTIONS__", "__COLLECT_PANEL__", "__COLLECT_SCRIPT__", "__BOOT_HOOK__",
+              "__DETAIL_SCRIPT__", "__DETAIL_TH__", "__IS_WEB__",
+              "__STATUS_SCRIPT__", "__STATUS_CONSTS__")
 
 
 def make_record(**over):
@@ -579,6 +581,323 @@ class TestZhitongParse(unittest.TestCase):
         self.assertIn("pn=2", self.mod._search_url("IT", "东莞", 2))
         self.assertNotIn("pn=1", self.mod._search_url("IT", "东莞", 1))
         self.assertNotIn("city=", self.mod._search_url("IT", "全国", 1))
+
+
+ZT_DETAIL_HTML = """
+<div class="main-left-box"><div class="left-common-info pos-base-info">
+<ul class="keyword-tags flex_Fw">
+  <li class="item-tag">ERP运维</li><li class="item-tag">PLM系统</li>
+  <li class="item-tag">ERP运维</li><li class="item-tag">  </li>
+</ul>
+<pre class="common-text-desc pos-desc">一、岗位职责：
+1. 负责 ERP&amp;OA 系统的日常运维。
+
+
+2. 处理&lt;故障&gt;报修。</pre>
+<pre class="common-text-desc com-desc">公司简介：本公司成立于1999年。</pre>
+</div></div>
+"""
+
+BOSS_DETAIL_HTML = """
+<div class="job-detail-section">
+  <h3>职位描述</h3>
+  <ul class="job-keyword-list">
+      <li>网络运维</li><li>Java</li><li>网络运维</li>
+  </ul>
+  <div class="job-sec-text">【岗位职责】<br/>1、负责员工电脑；<br/>
+  2、负责&nbsp;网络设备。</div>
+  <div class="job-boss-info"><h2 class="name">罗先生</h2></div>
+</div>
+"""
+
+
+class TestHtmlText(unittest.TestCase):
+    def test_line_breaks_kept_and_blank_runs_collapsed(self):
+        self.assertEqual(
+            html_text.to_lines("a<br/>b</p>c\n\n\nd   e&nbsp;f"),
+            "a\nb\nc\n\nd e f")   # 段落空行留一个，全角/不间断空格当空白压掉
+
+    def test_list_items_stripped_deduped_in_order(self):
+        self.assertEqual(html_text.list_items("<li> a </li><li>b</li><li>a</li><li> </li>"),
+                         ["a", "b"])
+
+
+class TestDetailParsers(unittest.TestCase):
+    """两家平台的正文块长得不一样，但都必须是服务端渲染的才能解析。"""
+
+    def test_zhitong_takes_job_desc_not_company_intro(self):
+        from jobstats.collectors import zhitong
+        d = zhitong.parse_detail(ZT_DETAIL_HTML)
+        self.assertIn("岗位职责", d["description"])
+        self.assertIn("2. 处理<故障>报修。", d["description"])   # 实体已反转义
+        self.assertIn("ERP&OA", d["description"])
+        self.assertNotIn("公司简介", d["description"])
+        self.assertEqual(d["keyword_tags"], ["ERP运维", "PLM系统"])
+
+    def test_zhitong_page_without_desc_block_is_empty(self):
+        from jobstats.collectors import zhitong
+        self.assertEqual(zhitong.parse_detail("<html><body>下架</body></html>"),
+                         {"description": "", "keyword_tags": []})
+
+    def test_boss_line_breaks_come_from_br_and_stop_at_container(self):
+        from jobstats.collectors import boss
+        d = boss.parse_detail(BOSS_DETAIL_HTML)
+        self.assertEqual(d["description"].splitlines(),
+                         ["【岗位职责】", "1、负责员工电脑；", "2、负责 网络设备。"])
+        self.assertNotIn("公司简介", d["description"])
+        self.assertNotIn("罗先生", d["description"])   # HR 信息不属于正文
+        self.assertEqual(d["keyword_tags"], ["网络运维", "Java"])
+
+
+class TestDetailStore(TempDbCase):
+    def make_job(self, jid="j1", platform="zhitong"):
+        return db.save_jobs([make_record(platform=platform, platform_job_id=jid,
+                                         url=f"https://example.com/job/{jid}")])
+
+    def test_roundtrip_and_overwrite(self):
+        self.make_job()
+        rec = {"platform": "zhitong", "platform_job_id": "j1",
+               "description": "岗位\n职责", "keyword_tags": ["ERP运维"], "url": "u"}
+        self.assertEqual(db.save_details([rec]), 1)
+        got = db.get_detail("zhitong", "j1")
+        self.assertEqual(got["description"], "岗位\n职责")
+        self.assertEqual(got["keyword_tags"], ["ERP运维"])
+        self.assertTrue(got["fetched_at"])
+        self.assertEqual(db.save_details([dict(rec, description="新JD")]), 1)
+        self.assertEqual(db.get_detail("zhitong", "j1")["description"], "新JD")
+        self.assertEqual(len(db.detail_keys()), 1)   # 覆盖，不是追加
+
+    def test_empty_description_rejected_and_whitelist_enforced(self):
+        self.make_job()
+        base = {"platform": "zhitong", "platform_job_id": "j1", "url": "u",
+                "keyword_tags": []}
+        self.assertEqual(db.save_details([dict(base, description="   ")]), 0)
+        self.assertIsNone(db.get_detail("zhitong", "j1"))
+        with self.assertRaises(ValueError):
+            db.save_details([dict(base, description="x", hr_phone="13900000000")])
+
+    def test_missing_listing_and_daily_counter(self):
+        self.make_job("j1")
+        self.make_job("j2")
+        db.save_details([{"platform": "zhitong", "platform_job_id": "j1",
+                          "description": "x", "keyword_tags": [], "url": "u"}])
+        self.assertEqual([j["platform_job_id"] for j in db.jobs_missing_details()], ["j2"])
+        self.assertEqual(db.jobs_missing_details(platform="boss"), [])
+        self.assertEqual(db.detail_keys(), ["zhitong:j1"])
+        self.assertEqual(db.count_details_today(), 1)
+
+    def test_export_csv_carries_description(self):
+        self.make_job()
+        db.save_details([{"platform": "zhitong", "platform_job_id": "j1",
+                          "description": "多行\n正文", "keyword_tags": [], "url": "u"}])
+        out = Path(self._tmp.name) / "e.csv"
+        db.export_csv(out)
+        text = out.read_text(encoding="utf-8-sig")
+        self.assertIn("description", text.splitlines()[0])
+        self.assertIn('"多行\n正文"', text)   # 换行留在引号里，Excel 不会串行
+
+
+def det_job(jid="j1", platform="zhitong"):
+    return {"id": 1, "platform": platform, "platform_job_id": jid,
+            "title": "IT运维", "company": "某某公司", "url": "https://x/j"}
+
+
+class TestCollectDetails(TempDbCase):
+    def test_cap_blocks_before_any_request(self):
+        with mock.patch.object(db, "count_details_today", return_value=20):
+            with self.assertRaises(RuntimeError) as ctx:
+                details.check_detail_cap()
+        self.assertIn("正文额度熔断", str(ctx.exception))
+
+    def test_already_fetched_skipped_unless_force(self):
+        db.save_details([{"platform": "zhitong", "platform_job_id": "j1",
+                          "description": "旧", "keyword_tags": [], "url": "u"}])
+        calls = []
+        fetchers = {"zhitong": lambda j: calls.append(j["platform_job_id"]) or
+                    {"platform": "zhitong", "platform_job_id": "j1",
+                     "description": "新", "keyword_tags": [], "url": "u"}}
+        with mock.patch.object(details, "FETCHERS", fetchers), \
+             mock.patch.object(details, "polite_sleep"):
+            self.assertEqual(details.collect_details([det_job()])["skipped"], 1)
+            self.assertEqual(calls, [])
+            details.collect_details([det_job()], force=True)
+        self.assertEqual(calls, ["j1"])
+        self.assertEqual(db.get_detail("zhitong", "j1")["description"], "新")
+
+    def test_sleeps_between_detail_pages_only(self):
+        seen = []
+
+        def fake(j):
+            seen.append(j["platform_job_id"])
+            return {"platform": "zhitong", "platform_job_id": j["platform_job_id"],
+                    "description": "d", "keyword_tags": [], "url": "u"}
+
+        jobs = [det_job("j1"), det_job("j2")]
+        with mock.patch.object(details, "FETCHERS", {"zhitong": fake}), \
+             mock.patch.object(details, "polite_sleep",
+                               side_effect=lambda: seen.append("sleep")) as nap:
+            res = details.collect_details(jobs)
+        self.assertEqual(nap.call_count, 1)      # 两条之间歇一次，最后一条不用
+        self.assertEqual(seen, ["j1", "sleep", "j2"])
+        self.assertEqual(res["saved"], 2)
+
+    def test_verification_error_aborts_whole_batch(self):
+        """平台弹验证：立刻停手，剩下的那条也不碰。"""
+        calls = []
+
+        def blocked(j):
+            calls.append(j["platform_job_id"])
+            raise RuntimeError("Boss 详情页弹出了人机验证")
+
+        jobs = [det_job("b1", "boss"), det_job("b2", "boss")]
+        with mock.patch.object(details, "FETCHERS", {"boss": blocked}), \
+             mock.patch.object(boss, "ensure_window", return_value=None), \
+             mock.patch.object(details, "polite_sleep"):
+            with self.assertRaises(RuntimeError):
+                details.collect_details(jobs)
+        self.assertEqual(calls, ["b1"])
+
+    def test_limit_caps_this_run(self):
+        calls = []
+
+        def fake(j):
+            calls.append(j["platform_job_id"])
+            return None
+
+        with mock.patch.object(details, "FETCHERS", {"zhitong": fake}), \
+             mock.patch.object(details, "polite_sleep"):
+            details.collect_details([det_job("j1"), det_job("j2")], limit=1)
+        self.assertEqual(calls, ["j1"])
+
+    def test_job51_detail_is_never_fetched(self):
+        """前程无忧详情页要滑块验证：按红线一个请求都不发。"""
+        from jobstats.collectors import job51
+        self.assertIsNone(job51.fetch_detail(det_job()))
+
+
+class TestDetailApiEndpoints(unittest.TestCase):
+    def test_web_page_has_detail_column_static_does_not(self):
+        web = report.render_web([make_record()], "T", "")
+        static = report._filter_html(report.STATIC_SUB_LINE, [make_record()], web=False)
+        self.assertIn("<th>正文</th>", web)
+        self.assertIn("const WEB = true;", web)
+        self.assertIn("/api/details", web)
+        self.assertNotIn("<th>正文</th>", static)
+        self.assertIn("const WEB = false;", static)
+        self.assertNotIn("toggleDetail", static)
+
+    def test_detail_text_rendered_as_text_not_html(self):
+        """正文里带标签也只能当文本显示（用 textContent 注入）。"""
+        js = report.DETAIL_JS
+        self.assertIn("pre.textContent = d.description", js)
+        self.assertNotIn("innerHTML = d.description", js)
+
+
+class TestApplicationStatus(TempDbCase):
+    """投递状态/备注是本地标注：采集路径写不到它，重采也冲不掉它。"""
+
+    def one_job(self):
+        db.save_jobs([make_record()])
+        return db.fetch_all()[0]["id"]
+
+    def test_old_database_gets_the_two_columns(self):
+        import sqlite3
+        old = ("CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+               " platform TEXT NOT NULL, platform_job_id TEXT NOT NULL, title TEXT,"
+               " company TEXT, salary_raw TEXT, salary_min REAL, salary_max REAL,"
+               " salary_months INTEGER, city TEXT, district TEXT, experience TEXT,"
+               " education TEXT, industry TEXT, company_scale TEXT, skills TEXT,"
+               " welfare TEXT, url TEXT, fetched_at TEXT, UNIQUE(platform, platform_job_id));")
+        db.DB_PATH.unlink()
+        conn = sqlite3.connect(db.DB_PATH)
+        try:
+            conn.execute(old)
+            conn.execute("INSERT INTO jobs(platform,platform_job_id,title,fetched_at) "
+                         "VALUES('job51','j1','老职位','2026-09-16 10:00:00')")
+            conn.commit()
+        finally:
+            conn.close()   # Windows 上不关掉句，tearDown 删不掉临时目录
+        db.init_db()
+        rows = db.fetch_all()
+        self.assertEqual(rows[0]["title"], "老职位")
+        self.assertEqual(rows[0]["status"], "")     # 迁移前的老行读出来是空串，不是 None
+        self.assertEqual(rows[0]["note"], "")
+
+    def test_status_and_note_each_only_touch_their_own_column(self):
+        jid = self.one_job()
+        self.assertEqual(db.set_status(jid, "已投"), {"status": "已投", "note": ""})
+        self.assertEqual(db.set_status(jid, note="约了周三面")["status"], "已投")
+        row = db.fetch_all()[0]
+        self.assertEqual((row["status"], row["note"]), ("已投", "约了周三面"))
+
+    def test_bad_input_rejected(self):
+        jid = self.one_job()
+        with self.assertRaises(ValueError):
+            db.set_status(jid, "已录取")            # 不在枚举里
+        self.assertIsNone(db.set_status(jid))       # 两列都没给
+        self.assertIsNone(db.set_status(9999, "已投"))
+        self.assertEqual(db.fetch_all()[0]["status"], "")
+
+    def test_note_is_capped(self):
+        jid = self.one_job()
+        self.assertEqual(len(db.set_status(jid, note="字" * (db.NOTE_MAX + 50))["note"]),
+                         db.NOTE_MAX)
+
+    def test_recollect_does_not_clobber_the_marks(self):
+        jid = self.one_job()
+        db.set_status(jid, "已投", "已发简历")
+        db.save_jobs([make_record()])               # 同一个关键词再采一遍
+        row = db.fetch_all()[0]
+        self.assertEqual((row["status"], row["note"]), ("已投", "已发简历"))
+
+    def test_collectors_cannot_write_these_columns(self):
+        with self.assertRaises(ValueError) as ctx:
+            db.save_jobs([dict(make_record(), status="已投")])
+        self.assertIn("白名单", str(ctx.exception))
+        self.assertNotIn("status", config.ALLOWED_FIELDS)
+        self.assertNotIn("note", config.ALLOWED_DETAIL_FIELDS)
+
+    def test_export_csv_has_status_and_note(self):
+        jid = self.one_job()
+        db.set_status(jid, "约面", '带逗号,"和引号"')
+        out = Path(self._tmp.name) / "s.csv"
+        db.export_csv(out)
+        text = out.read_text(encoding="utf-8-sig")
+        head = text.splitlines()[0].split(",")
+        self.assertEqual(head[-2:], ["fetched_at", "description"])
+        self.assertIn("status", head)
+        self.assertIn("约面", text)
+        self.assertIn('"带逗号,""和引号"""', text)
+
+
+class TestStatusUi(unittest.TestCase):
+    def test_web_page_marks_status_locally(self):
+        web = report.render_web([make_record(status="已投", note="约了周三")], "T", "")
+        self.assertIn("<th>状态</th>", web)
+        self.assertIn("function bindStatus", web)
+        self.assertIn("/api/status", web)      # 只打本地服务，不碰平台
+        for host in ("zhipin", "51job", "http"):
+            self.assertNotIn(host, report.STATUS_JS)
+
+    def test_static_page_shows_but_cannot_edit(self):
+        static = report._filter_html(report.STATIC_SUB_LINE, [make_record(status="已投")],
+                                     web=False)
+        self.assertIn("<th>状态</th>", static)
+        for marker in ("function bindStatus", "/api/status"):
+            self.assertNotIn(marker, static)
+        self.assertIn("`<td>${esc(r.status||'—')}</td>`", static)   # 静态页只显示文本
+
+    def test_status_options_have_one_source(self):
+        web = report.render_web([make_record()], "T", "")
+        self.assertIn("const STATUS = " + report._embed_json(list(db.STATUS_LABELS)) + ";", web)
+        self.assertIn(f"const NOTE_MAX = {db.NOTE_MAX};", web)
+
+    def test_empty_row_spans_every_column(self):
+        web = report.render_web([make_record()], "T", "")
+        static = report._filter_html(report.STATIC_SUB_LINE, [], web=False)
+        self.assertIn('colspan="${WEB?11:10}"', web)
+        self.assertIn('colspan="${WEB?11:10}"', static)
+        self.assertIn("cell.colSpan = 11;", report.DETAIL_JS)   # 正文行横跨整行
 
 
 if __name__ == "__main__":

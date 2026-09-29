@@ -8,6 +8,8 @@
   python cli.py collect --platform boss --query "python" --city 深圳 --pages 5
   python cli.py collect --platform job51 --query "python" --city 全国 --pages 3
   python cli.py collect --platform zhitong --query "python" --city 东莞
+  python cli.py detail --ids 562,560            # 只给要投的那几条抓正文（JD）
+  python cli.py detail --platform zhitong --limit 5   # 挑缺正文的职位补抓
   python cli.py report                       # 生成 HTML 统计报告
   python cli.py browse                       # 生成可离线双击打开的静态筛选台
   python cli.py report --demo                # 用演示数据看报告样式
@@ -19,8 +21,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from jobstats import db, report, server
+from jobstats import db, details, report, server
 from jobstats.collectors import boss, job51, zhitong
+from jobstats.config import DETAIL_DAILY_CAP
 
 COLLECTORS = {"boss": boss, "job51": job51, "zhitong": zhitong}
 
@@ -70,6 +73,22 @@ def cmd_export(args):
     print(f"已导出 CSV：{out}")
 
 
+def cmd_detail(args):
+    db.init_db()
+    if args.ids:
+        ids = [int(x) for x in args.ids.replace(",", " ").split() if x]
+        jobs = db.jobs_by_ids(ids)
+        if len(jobs) < len(ids):
+            print(f"有 {len(ids) - len(jobs)} 个行号在库里找不到，已忽略。")
+    else:
+        jobs = db.jobs_missing_details(platform=args.platform,
+                                       limit=args.limit or DETAIL_DAILY_CAP)
+    if not jobs:
+        print("没有需要抓正文的职位（都已经有正文了，或库里没有带详情页链接的职位）。")
+        return
+    details.collect_details(jobs, limit=args.limit, force=args.force)
+
+
 def cmd_serve(args):
     server.serve(port=args.port, open_browser=not args.no_browser)
 
@@ -102,6 +121,16 @@ def main():
     p = sub.add_parser("export", help="导出 CSV")
     p.add_argument("--out", default=None)
     p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser("detail", help="抓职位正文（JD）：逐条打开详情页，每日额度更小")
+    p.add_argument("--ids", default=None,
+                   help="只抓这几条（库里 id，逗号分隔）；不给就自动挑还没正文的职位")
+    p.add_argument("--platform", default=None, choices=list(COLLECTORS),
+                   help="只抓这个平台的（前程无忧详情页要滑块验证，按红线不抓）")
+    p.add_argument("--limit", type=int, default=None,
+                   help=f"本次最多抓几条（默认不超过每日额度 {DETAIL_DAILY_CAP} 条）")
+    p.add_argument("--force", action="store_true", help="已有正文的也重抓覆盖")
+    p.set_defaults(func=cmd_detail)
 
     p = sub.add_parser("serve", help="启动本地筛选台（页面里可直接采集/刷新，推荐）")
     p.add_argument("--port", type=int, default=server.DEFAULT_PORT)
