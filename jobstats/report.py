@@ -8,8 +8,9 @@ from html import escape as _esc
 from pathlib import Path
 
 from . import db
+from . import crossref
 from . import skills as tag_rules
-from .config import REPORT_DIR
+from .config import REPORT_DIR, STALE_AFTER_DAYS
 
 PLATFORM_NAMES = {"boss": "Boss直聘", "job51": "前程无忧", "zhitong": "智通直聘"}
 
@@ -36,24 +37,47 @@ def _mid(d):
     return None
 
 
+def _skill_caption(records: list[dict]) -> str:
+    """技能需求那张图的口径说明：词从哪儿来的、有多少条其实没数据。
+
+    不写这句就会读成"这些职位没技能要求"——智通的列表页根本没有技能这一列，
+    它的技能词只能从详情页关键词来（抓过正文才有），见 skills.NO_LIST_SKILLS。
+    """
+    def src(r: dict) -> str:
+        return r.get("skill_src") or ("list" if r.get("skills") else "")
+    n_list = sum(1 for r in records if src(r) == "list")
+    n_jd = sum(1 for r in records if src(r) == "jd")
+    n_none = sum(1 for r in records if not r.get("skills"))
+    no_list = "、".join(PLATFORM_NAMES.get(p, p) for p in tag_rules.NO_LIST_SKILLS)
+    if not no_list:
+        return f"{n_list} 条带技能标签，{n_none} 条没带。"
+    return (f"{len(records)} 条里 {n_list + n_jd} 条带技能词：{n_list} 条来自列表页标签，"
+            f"{n_jd} 条来自详情页关键词；{n_none} 条两处都没取到。"
+            f"注意 {no_list} 的列表页没有技能这一列，它那 {sum(1 for r in records if r['platform'] in tag_rules.NO_LIST_SKILLS)} 条"
+            f"只有抓过正文才可能有技能词——没词不等于没要求。")
+
+
 def build_stats(records: list[dict]) -> dict:
     total = len(records)
     by_platform = Counter(r["platform"] for r in records)
     mids = [m for r in records if (m := _mid(r))]
     cities = Counter(r["city"] for r in records if r.get("city") and r["city"] != "全国")
-    experiences = Counter(r["experience"] for r in records if r.get("experience"))
-    educations = Counter(r["education"] for r in records if r.get("education"))
+    # 这两张图跟筛选台同口径：先归档再数，否则 47 种经验写法会把图切成 47 个扇区
+    experiences = Counter(tag_rules.exp_bucket(r.get("experience")) for r in records)
+    educations = Counter(tag_rules.edu_bucket(r.get("education")) for r in records)
     # 清洗是幂等的：库里读出来已经统一过口径，演示数据和外部传入的原文再走一遍
     skills = Counter(s for r in records for s in tag_rules.clean(r.get("skills")))
     welfare = Counter(w for r in records for w in tag_rules.welfare(r.get("welfare")))
     industries = Counter(r["industry"] for r in records if r.get("industry"))
 
-    # 薪资直方图（千元/月）
-    bins = [(0, 5), (5, 10), (10, 15), (15, 20), (20, 25), (25, 30), (30, 40), (40, 60), (60, 100)]
+    # 薪资直方图（千元/月）。最后一档不设上限：
+    # 有上限的话，一条 12 万的岗位哪个档都不落，柱子加起来比总数小，读起来像"高薪岗更少"。
+    bins = [(0, 5), (5, 10), (10, 15), (15, 20), (20, 25), (25, 30), (30, 40), (40, 60),
+            (60, 100), (100, None)]
     hist = [0] * len(bins)
     for m in mids:
         for i, (lo, hi) in enumerate(bins):
-            if lo <= m < hi:
+            if lo <= m and (hi is None or m < hi):
                 hist[i] += 1
                 break
 
@@ -77,12 +101,14 @@ def build_stats(records: list[dict]) -> dict:
         "total": total,
         "platform_counts": {PLATFORM_NAMES.get(k, k): v for k, v in by_platform.most_common()},
         "salary_median": round(statistics.median(mids), 1) if mids else None,
-        "salary_hist_labels": [f"{lo}-{hi}k" for lo, hi in bins],
+        "salary_hist_labels": [f"{lo}-{hi}k" if hi else f"{lo}k以上" for lo, hi in bins],
         "salary_hist_values": hist,
         "top_cities": cities.most_common(12),
-        "experiences": experiences.most_common(8),
-        "educations": educations.most_common(8),
+        # 档位是固定那几种，全给出去，别按"前 8 名"截掉尾巴
+        "experiences": experiences.most_common(len(tag_rules.EXP_BUCKETS)),
+        "educations": educations.most_common(len(tag_rules.EDU_BUCKETS)),
         "top_skills": skills.most_common(15),
+        "skill_caption": _skill_caption(records),
         "top_welfare": welfare.most_common(10),
         "top_industries": industries.most_common(10),
         "platform_salary": plat_salary,
@@ -115,6 +141,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
   .panel { background:var(--card); border-radius:10px; padding:16px; box-shadow:0 1px 3px rgba(0,0,0,.06); }
   .panel h3 { font-size:15px; margin-bottom:10px; }
+  .cap { color:var(--muted); font-size:12px; margin:-6px 0 10px; line-height:1.6; }
   .chart { width:100%; height:320px; }
   .chart-tall { height:380px; }
   table { width:100%; border-collapse:collapse; font-size:13px; }
@@ -143,7 +170,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="panel"><h3>各平台职位数量</h3><div id="plat" class="chart"></div></div>
   <div class="panel"><h3>各平台薪资中位数对比（K）</h3><div id="psal" class="chart"></div></div>
   <div class="panel"><h3>城市 Top 12</h3><div id="city" class="chart"></div></div>
-  <div class="panel"><h3>技能需求 Top 15</h3><div id="skill" class="chart chart-tall"></div></div>
+  <div class="panel"><h3>技能需求 Top 15</h3><div class="cap">__SKILL_CAP__</div>
+    <div id="skill" class="chart chart-tall"></div></div>
   <div class="panel"><h3>学历要求分布</h3><div id="edu" class="chart"></div></div>
   <div class="panel"><h3>经验要求分布</h3><div id="exp" class="chart"></div></div>
   <div class="panel"><h3>福利标签 Top 10</h3><div id="wel" class="chart"></div></div>
@@ -155,6 +183,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 <script>
 const C = window.__STATS__;
+if (!window.echarts) {
+  // 图表库是从 cdn.jsdelivr.net 拉下来的：断网、被拦、或者把这份 HTML 拷给别人
+  // 对方没网时，下面整个 script 会直接挂在这里，八张图的位置只剩一片空白，
+  // 看的人只会以为是数据出了问题。空着不写不如说清楚。
+  document.querySelectorAll('.chart').forEach(el => {
+    el.innerHTML = '<div style="padding:24px 12px;color:#646a73;font-size:13px;'
+      + 'line-height:1.8">图没画出来：这一页的图表库要从 cdn.jsdelivr.net 加载，'
+      + '现在连不上。<br>上面的总数、中位数和下面的职位表格都是本地算的，不受影响。'
+      '联网后刷新这一页就有图了。</div>';
+  });
+} else {
 const mk = (id, opt) => echarts.init(document.getElementById(id)).setOption(opt);
 const axis = { axisLabel:{color:'#646a73'}, axisLine:{lineStyle:{color:'#d8dae0'}} };
 
@@ -195,6 +234,7 @@ const donut = (id, data) => { if (!data.length) { document.getElementById(id).pa
   mk(id, { tooltip:{}, series:[{type:'pie',radius:['40%','68%'],
     data:data.map(([k,v])=>({name:k,value:v})), label:{color:'#1f2329'} }] }); };
 donut('edu', C.educations); donut('exp', C.experiences); donut('wel', C.top_welfare);
+}
 </script>
 </body>
 </html>"""
@@ -220,6 +260,7 @@ def render(stats: dict) -> str:
     html = html.replace("__PLAT_N__", str(len(stats["platform_counts"])))
     html = html.replace("__MEDIAN__", str(stats["salary_median"] or "—"))
     html = html.replace("__CITY_N__", str(len(stats["top_cities"])))
+    html = html.replace("__SKILL_CAP__", _esc(stats["skill_caption"], quote=False))
     html = html.replace("__TABLE_ROWS__", "\n".join(rows))
     # 注入数据
     html = html.replace("window.__STATS__", _embed_json(stats))
@@ -268,8 +309,11 @@ def _demo_records() -> list[dict]:
             "industry": "", "company_scale": "",
             "skills": rnd_skills[k], "welfare": ["五险一金", "带薪年假", "节日福利"][:1 + i % 3],
             "url": "", "fetched_at": f"2026-09-16 {10 + i % 12:02d}:{i % 60:02d}:00",
+            # 每 5 条给一个"一个多月前最后见过"，让界面预览里两种状态都看得到
+            "last_seen_at": (f"2026-09-16 {10 + i % 12:02d}:{i % 60:02d}:00" if i % 5
+                             else f"2026-08-05 {10 + i % 12:02d}:{i % 60:02d}:00"),
         })
-    return out
+    return [tag_rules.add_buckets(r) for r in out]
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +322,8 @@ def _demo_records() -> list[dict]:
 #
 # 槽位：__SUB_LINE__ __GENERATED_AT__ __N__ __DATA__ __TOKEN__ __IS_WEB__ __STATUS_CONSTS__
 #       __COLLECT_PANEL__ __COLLECT_SCRIPT__ __DETAIL_SCRIPT__ __DETAIL_TH__
-#       __STATUS_SCRIPT__ __BOOT_HOOK__ __CITY_OPTIONS__
+#       __STATUS_SCRIPT__ __BOOT_HOOK__ __CITY_OPTIONS__ __NO_DETAIL__
+#       __DELETE_TH__ __DELETE_BAR__ __DELETE_SCRIPT__
 # ---------------------------------------------------------------------------
 FILTER_TEMPLATE = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -308,17 +353,20 @@ FILTER_TEMPLATE = """<!DOCTYPE html>
   input[type=text].kw { width:240px; }
   button:hover { border-color:var(--accent); color:var(--accent); cursor:pointer; }
   button.on { background:var(--accent); border-color:var(--accent); color:#fff; }
-  button.chip { border-radius:14px; padding:3px 12px; }
+  button.chip { border-radius:14px; padding:3px 12px; white-space:nowrap; }
   button.ghost { background:#fff; }
   button:disabled { opacity:.55; cursor:not-allowed; }
   .hint { color:var(--muted); font-size:12px; }
+  .stale { color:#d83b01; }
+  .tcol { white-space:nowrap; }   /* 日期别在中间断行："2026-10-" / "13" 读起来很费劲 */
   .ftag { display:inline-flex; align-items:center; gap:5px; background:#eef3ff;
           color:var(--accent); border-radius:14px; padding:3px 10px; font-size:12px; }
   .ftag b { cursor:pointer; font-weight:400; opacity:.6; padding:0 2px; }
   .ftag b:hover { opacity:1; }
   table { width:100%; border-collapse:collapse; font-size:13px; }
   th,td { text-align:left; padding:8px 10px; border-bottom:1px solid #eceef1; vertical-align:top; }
-  th { color:var(--muted); font-weight:500; background:#fafbfc; position:sticky; top:0; }
+  th { color:var(--muted); font-weight:500; background:#fafbfc; position:sticky; top:0;
+       white-space:nowrap; }   /* 表头换行会被挤成竖排（"匹/配/度"），列宽让给内容就好 */
   td a { color:var(--accent); text-decoration:none; }
   .plat-badge { display:inline-block; padding:1px 8px; border-radius:4px; font-size:12px; }
   .p-boss { background:#e8f7ee; color:#00b578; }
@@ -340,6 +388,18 @@ FILTER_TEMPLATE = """<!DOCTYPE html>
   select.st { width:92px; }
   input.st-note { width:150px; margin-top:4px; display:block; }
   .st-saved { border-color:#00b578; }
+  /* 跨平台对照的小标签：跟"疑似已下架"一样是提示，不占一整列 */
+  .xref { display:inline-block; font-size:11px; color:#7f61f0; background:#f0ebff;
+          border:1px solid #ddd2ff; border-radius:10px; padding:1px 8px; margin-top:4px; }
+  button.xref { cursor:pointer; }
+  button.xref:hover { border-color:#7f61f0; color:#7f61f0; }
+  .xref-item { display:flex; flex-wrap:wrap; align-items:center; gap:10px;
+               padding:6px 0; border-bottom:1px dashed #eceef1; }
+  .xref-item:last-child { border-bottom:none; }
+  .xref-det { width:100%; }
+  /* 技能列的来源标记：这几个词不是列表页的技能标签，是从详情页关键词兜过来的 */
+  .srcjd { display:inline-block; font-size:11px; color:#8a6a00; background:#fff8e1;
+           border:1px solid #f3e0a8; border-radius:10px; padding:1px 8px; }
 </style>
 </head>
 <body>
@@ -369,12 +429,19 @@ __COLLECT_PANEL__
     <span id="salary-presets"></span>
   </div>
   <div class="row">
-    <span class="grp-lbl">学历</span>
-    <span id="edu-chips"></span>
+    <span class="grp-lbl">行业</span>
+    <select id="f-industry"></select>
+    <span class="hint">按平台给的一级行业筛；前程无忧列表页没这字段，那批在"未标注"里。"生产制造"里也混着视觉/机器人开发岗，批量删之前看一眼确认框</span>
   </div>
   <div class="row">
-    <span class="grp-lbl">经验</span>
+    <span class="grp-lbl" title="平台原文有十种写法（`中专`/`中专/中技`/`中技/中专` 是同一种），这里并成 6 档。悬停每个档位看它合并了哪些写法；导出 CSV 里仍是原文。">学历</span>
+    <span id="edu-chips"></span>
+    <span class="hint">10 种写法并成 6 档，可多选</span>
+  </div>
+  <div class="row">
+    <span class="grp-lbl" title="按最低要求归档：`3年及以上`、`经验3-10年`、`3-5年` 都进 3-5年——能不能投只看门槛，上限不参与（`经验5-8年` 和 `经验5年及以上` 算同一类）。">经验</span>
     <span id="exp-chips"></span>
+    <span class="hint">47 种写法并成 7 档，按最低要求归档</span>
   </div>
   <div class="row">
     <span class="grp-lbl">状态</span>
@@ -382,9 +449,21 @@ __COLLECT_PANEL__
     <span class="hint">状态是你自己标的投递进度，只写本地，不会去平台查任何东西</span>
   </div>
   <div class="row">
+    <span class="grp-lbl">还在招吗</span>
+    <select id="f-seen">
+      <option value="">全部</option>
+      <option value="fresh">最近 __STALE_DAYS__ 天见过的</option>
+      <option value="stale">疑似已下架（超过 __STALE_DAYS__ 天没再采到）</option>
+    </select>
+    <span class="hint">平台不会告诉我们职位下架了，这里只能按"最后一次采到它是什么时候"推断，
+    仅供参考；长期不投的关键词本来就不会再见到</span>
+  </div>
+  <div class="row">
     <span class="grp-lbl">排序</span>
     <select id="f-sort">
       <option value="latest">最新采集</option>
+      <option value="seen_desc">最近还见到的</option>
+      <option value="score_desc">匹配度从高到低</option>
       <option value="salary_desc">薪资从高到低</option>
       <option value="salary_asc">薪资从低到高</option>
     </select>
@@ -392,18 +471,20 @@ __COLLECT_PANEL__
     <button class="ghost" id="btn-export">导出当前结果 CSV</button>
     <span class="hint" id="filter-hint"></span>
   </div>
+__DELETE_BAR__
   <div class="row" id="active-tags" style="margin-bottom:0"></div>
 </div>
 
 <div class="card">
   <div class="pbar" id="pbar"></div>
   <div class="legend" id="plegend"></div>
+  <div class="legend" id="skill-note"></div>
 </div>
 
 <div class="card">
   <table>
     <thead><tr><th>平台</th><th>职位</th><th>公司</th><th>薪资</th><th>城市</th>
-    <th>经验</th><th>学历</th><th>技能标签</th><th>采集时间</th><th>状态</th>__DETAIL_TH__</tr></thead>
+    <th>经验</th><th>学历</th><th>技能标签</th><th>首次采集</th><th>最近见到</th><th>状态</th><th>匹配度</th>__DETAIL_TH____DELETE_TH__</tr></thead>
     <tbody id="tbody"></tbody>
   </table>
   <div class="pager">
@@ -418,17 +499,34 @@ let DATA = __DATA__;
 const WEB = __IS_WEB__;
 __STATUS_CONSTS__
 const PNAME = {boss:'Boss直聘', job51:'前程无忧', zhitong:'智通直聘'};
+// 哪些平台的正文拿不到、为什么：服务版给出原因，静态版是空表（那一版没有正文按钮）
+const NO_DETAIL = __NO_DETAIL__;
+// 哪些平台的列表页压根没有技能列：那几行的技能只能来自详情页的职位关键词（抓过正文才有）
+const NO_LIST_SKILLS = __NO_LIST_SKILLS__;
 const PAGE_SIZE = 20;
 const TOKEN = '__TOKEN__';
+const STALE_DAYS = __STALE_DAYS__;
 const PRESETS = [['不限',null,null],['≤10K',null,10],['10-20K',10,20],['20-30K',20,30],['≥30K',30,null]];
-const st = { plat:new Set(), city:'', edu:new Set(), exp:new Set(), kw:'',
-             smin:null, smax:null, sort:'latest', status:'', page:1, filtered:[] };
+const st = { plat:new Set(), city:'', industry:'', edu:new Set(), exp:new Set(), kw:'',
+             smin:null, smax:null, sort:'latest', status:'', seen:'', page:1, filtered:[] };
 
 const uniq = a => [...new Set(a.filter(Boolean))];
 const esc = s => String(s??'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const safeUrl = u => { const s = String(u ?? '').toLowerCase();
   return s.startsWith('http://') || s.startsWith('https://') ? u : ''; };
 const mid = r => (r.salary_min && r.salary_max) ? (r.salary_min + r.salary_max)/2 : null;
+// 行业取一级：智通是"生产制造-模具"两段式，Boss 只有一段，前程无忧列表页压根没这字段
+const indKey = r => String(r.industry || '').split('-')[0].trim();
+// 对照标签只列平台名（同一平台多条也合成一个）， details 留在展开的面板里
+const xrNames = cs => [...new Set(cs.map(c => PNAME[c.platform] || c.platform))].join('、');
+// "最近见到"：last_seen_at 每次重新采到都会往后推，fetched_at 是第一次采到的时刻。
+// 老库里 last_seen_at 是补列回填的，取不到就退回 fetched_at。
+const seenAt = r => r.last_seen_at || r.fetched_at || '';
+const daysUnseen = r => {
+  const t = Date.parse(String(seenAt(r)).replace(' ', 'T'));
+  return isNaN(t) ? null : (Date.now() - t) / 86400000;
+};
+const isStale = r => { const d = daysUnseen(r); return d !== null && d > STALE_DAYS; };
 
 function toggle(set, v){ set.has(v) ? set.delete(v) : set.add(v); }
 
@@ -449,23 +547,48 @@ function buildUI(){
     `<option value="">全部城市</option>` + cities.map(c=>`<option>${esc(c)}</option>`).join('');
   document.getElementById('f-city').onchange = e => { st.city=e.target.value; st.page=1; apply(); };
 
+  // 行业（一级），带上条数；没给行业的那批单独归到"未标注"，不然它们谁也筛不到
+  const indCnt = {};
+  DATA.forEach(r => { const k = indKey(r); indCnt[k] = (indCnt[k]||0)+1; });
+  // 条数多的排前面：噪音行业本来就碎，按字面排序等于让人在一堆 (1) 里找
+  const inds = Object.keys(indCnt).sort((a,b) =>
+    (a?0:1)-(b?0:1) || indCnt[b]-indCnt[a] || a.localeCompare(b,'zh'));
+  document.getElementById('f-industry').innerHTML =
+    `<option value="">全部行业</option>` + inds.map(k =>
+      `<option value="${esc(k || '__none__')}">${esc(k || '未标注')} (${indCnt[k]})</option>`).join('');
+  document.getElementById('f-industry').onchange =
+    e => { st.industry=e.target.value; st.page=1; apply(); };
+
   // 投递状态（"未标注"= 还没标过的，用来挑下一步投哪些）
   document.getElementById('f-status').innerHTML =
     `<option value="">全部状态</option><option value="__none__">未标注</option>` +
     STATUS.filter(Boolean).map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
   document.getElementById('f-status').onchange = e => { st.status=e.target.value; st.page=1; apply(); };
 
-  // 学历/经验 chips（按数量排序，可多选）
-  const chip = (arr, key, box, attr) => {
-    const cnt = {}; arr.forEach(v => cnt[v]=(cnt[v]||0)+1);
-    document.getElementById(box).innerHTML = Object.entries(cnt)
-      .sort((a,b)=>b[1]-a[1]).map(([v]) => `<button class="chip" data-${attr}="${esc(v)}">${esc(v)}</button>`).join('');
+  // 还在不在招：只有"最后一次采到它"这一个间接证据，界面措辞别写成平台给的状态
+  document.getElementById('f-seen').onchange = e => { st.seen=e.target.value; st.page=1; apply(); };
+
+  // 学历/经验 chips：档位由 Python 侧归一（skills.exp_bucket / edu_bucket），这里按固定
+  // 档序排、不按条数排——换一批数据顺序不该变。chip 仍然多选（本科+大专一起看很常用）。
+  const chip = (bkey, rawKey, key, box, attr, order) => {
+    const cnt = {}, raws = {};
+    DATA.forEach(r => {
+      const b = r[bkey] || '未标注';
+      cnt[b] = (cnt[b] || 0) + 1;
+      (raws[b] = raws[b] || new Set()).add(r[rawKey] || '（平台没写）');
+    });
+    const rank = v => { const i = order.indexOf(v); return i < 0 ? 99 : i; };
+    document.getElementById(box).innerHTML = Object.keys(cnt)
+      .sort((a, b) => rank(a) - rank(b) || cnt[b] - cnt[a])
+      .map(v => `<button class="chip" data-${attr}="${esc(v)}" `
+        + `title="这一档合并了平台的这些写法：${esc([...raws[v]].join('、'))}（${cnt[v]} 条）">`
+        + `${esc(v)}</button>`).join('');
     document.querySelectorAll(`[data-${attr}]`).forEach(b =>
       b.onclick = () => { toggle(st[key], b.dataset[attr]);
         b.classList.toggle('on'); st.page=1; apply(); });
   };
-  chip(uniq(DATA.map(r=>r.education)), 'edu', 'edu-chips', 'edu');
-  chip(uniq(DATA.map(r=>r.experience)), 'exp', 'exp-chips', 'exp');
+  chip('education_bucket', 'education', 'edu', 'edu-chips', 'edu', EDU_ORDER);
+  chip('experience_bucket', 'experience', 'exp', 'exp-chips', 'exp', EXP_ORDER);
 
   // 薪资预设（选中高亮；手动改输入框时自动取消高亮）
   const syncPresets = () => {
@@ -502,7 +625,9 @@ function buildUI(){
 function syncUI(){
   document.querySelectorAll('[data-plat]').forEach(b => b.classList.toggle('on', st.plat.has(b.dataset.plat)));
   document.getElementById('f-city').value = st.city;
+  document.getElementById('f-industry').value = st.industry;
   document.getElementById('f-status').value = st.status;
+  document.getElementById('f-seen').value = st.seen;
   document.querySelectorAll('[data-edu]').forEach(b => b.classList.toggle('on', st.edu.has(b.dataset.edu)));
   document.querySelectorAll('[data-exp]').forEach(b => b.classList.toggle('on', st.exp.has(b.dataset.exp)));
   document.getElementById('f-smin').value = st.smin??'';
@@ -520,9 +645,14 @@ function apply(){
   let rs = DATA.filter(r => {
     if (st.plat.size && !st.plat.has(r.platform)) return false;
     if (st.city && r.city !== st.city) return false;
-    if (st.edu.size && !st.edu.has(r.education)) return false;
-    if (st.exp.size && !st.exp.has(r.experience)) return false;
+    if (st.industry){
+      const k = indKey(r);
+      if (st.industry === '__none__' ? k : k !== st.industry) return false;
+    }
+    if (st.edu.size && !st.edu.has(r.education_bucket)) return false;
+    if (st.exp.size && !st.exp.has(r.experience_bucket)) return false;
     if (st.status && (r.status || '') !== (st.status === '__none__' ? '' : st.status)) return false;
+    if (st.seen && (isStale(r) !== (st.seen === 'stale'))) return false;
     if (st.smin!==null || st.smax!==null){
       const m = mid(r);
       if (m===null) return false;
@@ -535,7 +665,11 @@ function apply(){
     }
     return true;
   });
-  if (st.sort==='salary_desc') rs.sort((a,b)=>(mid(b)??-1)-(mid(a)??-1));
+  // 没跑过模型的排最后；分数相同的按采集时间，免得同分时顺序每次都变
+  if (st.sort==='score_desc') rs.sort((a,b) => (b.score??-1)-(a.score??-1)
+    || String(b.fetched_at).localeCompare(String(a.fetched_at)));
+  else if (st.sort==='seen_desc') rs.sort((a,b)=>String(seenAt(b)).localeCompare(String(seenAt(a))));
+  else if (st.sort==='salary_desc') rs.sort((a,b)=>(mid(b)??-1)-(mid(a)??-1));
   else if (st.sort==='salary_asc') rs.sort((a,b)=>(mid(a)??1e9)-(mid(b)??1e9));
   else rs.sort((a,b)=>String(b.fetched_at).localeCompare(String(a.fetched_at)));
   st.filtered = rs;
@@ -548,9 +682,12 @@ function renderActiveTags(){
   const tags = [];
   st.plat.forEach(v => tags.push({k:'plat', v, t:PNAME[v]}));
   if (st.city) tags.push({k:'city', v:st.city, t:'城市: '+st.city});
+  if (st.industry) tags.push({k:'industry', v:st.industry,
+                              t:'行业: ' + (st.industry==='__none__'?'未标注':st.industry)});
   st.edu.forEach(v => tags.push({k:'edu', v, t:'学历: '+v}));
   st.exp.forEach(v => tags.push({k:'exp', v, t:'经验: '+v}));
   if (st.status) tags.push({k:'status', v:'', t:'状态: ' + (st.status==='__none__'?'未标注':st.status)});
+  if (st.seen) tags.push({k:'seen', v:'', t: st.seen==='stale' ? '只看疑似已下架' : '只看最近见过的'});
   if (st.smin!==null || st.smax!==null){
     const t = '月薪: ' + (st.smin??'') + ' ~ ' + (st.smax??'') + 'K';
     tags.push({k:'salary', v:'', t});
@@ -566,6 +703,7 @@ function renderActiveTags(){
 function removeFilter(k, v){
   if (k==='plat'){ st.plat.delete(v); const el=document.querySelector(`[data-plat="${v}"]`); el&&el.classList.remove('on'); }
   else if (k==='city'){ st.city=''; document.getElementById('f-city').value=''; }
+  else if (k==='industry'){ st.industry=''; document.getElementById('f-industry').value=''; }
   else if (k==='status'){ st.status=''; document.getElementById('f-status').value=''; }
   else if (k==='edu'){ st.edu.delete(v); const el=document.querySelector(`[data-edu="${CSS.escape(v)}"]`); el&&el.classList.remove('on'); }
   else if (k==='exp'){ st.exp.delete(v); const el=document.querySelector(`[data-exp="${CSS.escape(v)}"]`); el&&el.classList.remove('on'); }
@@ -576,18 +714,45 @@ function removeFilter(k, v){
   st.page=1; apply();
 }
 
+function median(sorted){
+  // 偶数条取中间两个的平均，跟 Python 侧 statistics.median 对齐：
+  // 只取上中位的话，同一批职位在报告和筛选台上能差出 1K，而这两处是拿来对照的。
+  const n = sorted.length;
+  if (!n) return null;
+  return n % 2 ? sorted[(n-1)/2] : (sorted[n/2-1] + sorted[n/2]) / 2;
+}
+
 function renderStats(){
   const rs = st.filtered, mids = rs.map(mid).filter(m=>m!==null);
   document.getElementById('s-count').textContent = rs.length;
-  document.getElementById('s-median').textContent = mids.length
-    ? (mids.slice().sort((a,b)=>a-b)[Math.floor(mids.length/2)]).toFixed(1) : '—';
+  const med = median(mids.slice().sort((a,b)=>a-b));
+  document.getElementById('s-median').textContent = med===null ? '—' : med.toFixed(1);
   document.getElementById('s-range').textContent = mids.length
     ? Math.round(Math.min(...mids)) + ' ~ ' + Math.round(Math.max(...mids)) : '—';
   document.getElementById('s-city').textContent = uniq(rs.map(r=>r.city)).length;
-  const active = st.plat.size + (st.city?1:0) + st.edu.size + st.exp.size + (st.status?1:0)
+  const active = st.plat.size + (st.city?1:0) + (st.industry?1:0) + st.edu.size + st.exp.size
+    + (st.status?1:0)
     + ((st.smin!==null||st.smax!==null)?1:0) + (st.kw?1:0);
   document.getElementById('filter-hint').textContent =
     active ? `已启用 ${active} 个筛选条件` : '未启用筛选，显示全部数据';
+  renderSkillNote(rs);
+}
+
+// 技能列有两个来源，混在一起数会把"平台没给这一列"看成"这些职位没技能要求"，
+// 所以按当前筛选结果把来源和缺口都摆出来（NO_LIST_SKILLS 是 skills.py 里那张能力表）。
+function renderSkillNote(rs){
+  const el = document.getElementById('skill-note');
+  if (!el) return;
+  const jd = rs.filter(r => r.skill_src === 'jd').length;
+  const none = rs.filter(r => !(r.skills || []).length).length;
+  const noList = uniq(rs.filter(r => NO_LIST_SKILLS[r.platform]).map(r => r.platform));
+  if (!jd && !none) { el.innerHTML = ''; return; }
+  el.innerHTML = `<span>技能列：${rs.length - none} 条有词，其中 ${jd} 条来自详情页关键词`
+    + (none ? `，${none} 条列表页和正文里都没取到` : '')
+    + (noList.length ? `<span class="hint" title="${esc(noList.map(p =>
+          NO_LIST_SKILLS[p]).join('\\n'))}">`
+        + `（${esc(noList.map(p => PNAME[p] || p).join('、'))} 的列表页没有技能这一列）</span>` : '')
+    + '</span>';
 }
 
 const PCOLOR = {boss:'#00b578', job51:'#ff8f1f', zhitong:'#7f61f0'};
@@ -603,6 +768,10 @@ function renderPlatformBar(){
     .map(p=>`<span><i style="background:${PCOLOR[p]}"></i>${PNAME[p]} ${cnt[p]} 条</span>`).join('');
 }
 
+// 表里显示归一后的档位，平台原文进悬停提示——归档是为了能筛，不是改掉平台写过的话
+const bucketTd = (b, raw) => `<td title="平台原文：${esc(raw || '（平台没写）')}">`
+  + `${esc(b || '未标注')}</td>`;
+
 function renderTable(){
   const rs = st.filtered;
   const max = Math.max(1, Math.ceil(rs.length/PAGE_SIZE));
@@ -612,10 +781,32 @@ function renderTable(){
     const m = mid(r);
     const sal = m!==null ? `${esc(r.salary_raw)} <span class="hint">≈${m.toFixed(1)}K/月</span>` : esc(r.salary_raw||'—');
     const u = safeUrl(r.url);
-    const title = u ? `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(r.title)}</a>` : esc(r.title);
+    // 行号（库里的 id）原来只藏在删除/标注按钮的属性里，屏幕上看不见，
+    // 而 status 和 README 都让人去敲 `detail --ids 行号`——那条路等于没有。挂在标题上一悬就出。
+    const tip = ` title="本机行号 ${esc(r.id)}；只给这条抓正文：python cli.py detail --ids ${esc(r.id)}"`;
+    const title = u ? `<a href="${esc(u)}" target="_blank" rel="noopener"${tip}>${esc(r.title)}</a>`
+                    : `<span${tip}>${esc(r.title)}</span>`;
+    // 跨平台对照：判据是归一后的公司名+职位名，只会漏不会认错，所以措辞是"另见"而不是"重复"
+    const xrs = r.cross || [];
+    const xtip = '按归一后的公司名和职位名对上的另一条。只能说明别处也发了，'
+      + '对不上不代表别处一定没有（代招换了主体名、标题写法不同都会漏）。';
+    const xr = xrs.length
+      ? (WEB ? `<button class="xref" data-xref="${esc(r.id)}" title="${esc(xtip)}">另见 ${xrNames(xrs)}</button>`
+             : `<span class="xref" title="${esc(xtip)}（静态页只能看提示，服务版里点开可对照）">另见 ${xrNames(xrs)}</span>`)
+      : '';
     const tags = (r.skills||[]).slice(0,6).map(s=>`<span class="tag">${esc(s)}</span>`).join('');
+    // 技能列有两个来源：列表页标签，和列表页不给这一列的平台从详情页关键词兜过来的
+    const nl = NO_LIST_SKILLS[r.platform] || '';
+    const skillTd = tags
+      ? `<td>${tags}`
+        + `${r.skill_src === 'jd' ? `<div><span class="srcjd" title="这几个词是从详情页的职位关键词里取的`
+            + `——这个平台的列表页没有技能标签那一列（悬停看详细说明）">来自详情页</span></div>` : ''}`
+        + `</td>`
+      : `<td>${nl ? `<span class="hint" title="${esc(nl)}">没采到技能</span>` : '—'}</td>`;
+    const nd = NO_DETAIL[r.platform] || '';
     const det = WEB ? `<td><button class="chip" data-det="1" data-id="${esc(r.id)}"
-      data-key="${esc(detKey(r))}">${DET.has(detKey(r)) ? '看正文' : '抓正文'}</button></td>` : '';
+      data-key="${esc(detKey(r))}"${nd ? ` data-nd="${esc(nd)}" title="${esc(nd)}"` : ''}>`
+      + `${nd ? '不抓正文' : (DET.has(detKey(r)) ? '看正文' : '抓正文')}</button></td>` : '';
     const stCell = WEB ? `<td>
       <select class="st" data-st="${esc(r.id)}">${STATUS.map(s =>
         `<option value="${esc(s)}"${(r.status||'')===s?' selected':''}>${esc(s||'未标注')}</option>`
@@ -623,23 +814,42 @@ function renderTable(){
       <input type="text" class="st-note" data-note="${esc(r.id)}" placeholder="记一句"
         maxlength="${NOTE_MAX}" value="${esc(r.note||'')}"></td>`
       : `<td>${esc(r.status||'—')}</td>`;
+    // 匹配度是本地模型算完回写的，没跑过就是空；理由和缺口放悬停提示，免得把表格挤宽
+    const why = [r.reasons, (r.gaps || []).length ? '缺口 ' + r.gaps.join(' / ') : '',
+                 r.model ? '· ' + r.model : ''].filter(Boolean).join(' ');
+    const scoreCell = (r.score === null || r.score === undefined)
+      ? '<td class="hint">—</td>'
+      : `<td title="${esc(why)}">${Math.round(r.score)}</td>`;
+    const delCell = WEB ? `<td><button class="chip" data-del="${esc(r.id)}"
+      title="从本地库删掉这一条（可以撤销）">删</button></td>` : '';
+    // "最近见到"只到日：这一列是"最后一次采到它"，超过阈值就是疑似下架
+    const seen = String(seenAt(r)).slice(0, 10) || '—';
+    const seenTd = isStale(r)
+      ? `<td class="hint tcol"><span class="stale" title="已经 ${Math.floor(daysUnseen(r))} 天没再采到，`
+        + `平台那边大概已经下架了（这是我推断的，不是平台给的状态）">⚠ ${esc(seen)}</span></td>`
+      : `<td class="hint tcol">${esc(seen)}</td>`;
+    // 两列时间都只到日，完整时刻放悬停：带时分秒的话 1100px 宽的窗口会横向溢出
+    const fetchedTd = `<td class="hint tcol" title="首次采到的完整时刻：${esc(r.fetched_at)}">`
+      + `${esc(String(r.fetched_at).slice(0, 10))}</td>`;
     return `<tr>
       <td><span class="plat-badge p-${r.platform}">${PNAME[r.platform]||r.platform}</span></td>
-      <td>${title}</td><td>${esc(r.company)}</td><td>${sal}</td>
+      <td>${title}${xr ? `<div>${xr}</div>` : ''}</td><td>${esc(r.company)}</td><td>${sal}</td>
       <td>${esc([r.city,r.district].filter(Boolean).join('·'))}</td>
-      <td>${esc(r.experience||'—')}</td><td>${esc(r.education||'—')}</td>
-      <td>${tags||'—'}</td><td class="hint">${esc(r.fetched_at)}</td>${stCell}${det}</tr>`;
+      ${bucketTd(r.experience_bucket, r.experience)}${bucketTd(r.education_bucket, r.education)}
+      ${skillTd}${fetchedTd}${seenTd}${stCell}${scoreCell}${det}${delCell}</tr>`;
   }).join('');
   document.getElementById('tbody').innerHTML = rows
-    || `<tr><td colspan="${WEB?11:10}" class="hint" style="text-align:center;padding:30px">没有符合筛选条件的职位，试试放宽条件</td></tr>`;
-  if (WEB) { bindDetails(); bindStatus(); }
+    || `<tr><td colspan="${WEB?14:12}" class="hint" style="text-align:center;padding:30px">没有符合筛选条件的职位，试试放宽条件</td></tr>`;
+  if (WEB) { bindDetails(); bindStatus(); bindDelete(); }
   document.getElementById('pg-info').textContent = rs.length
     ? `第 ${st.page}/${max} 页 · 共 ${rs.length} 条` : '';
+  const delBtn = document.getElementById('btn-del-filtered');
+  if (delBtn) delBtn.textContent = `删除当前筛选出的 ${rs.length} 条`;
 }
 
 function exportCSV(){
   const head = ['平台','职位','公司','薪资原文','月薪下限K','月薪上限K','发薪月数','年薪估算万',
-    '城市','经验','学历','技能','福利','状态','备注','链接','采集时间'];
+    '城市','经验','学历','技能','福利','状态','备注','链接','首次采集','最近见到'];
   const lines = [head.join(',')];
   st.filtered.forEach(r => {
     const q = v => `"${String(v??'').replace(/"/g,'""')}"`;
@@ -649,7 +859,7 @@ function exportCSV(){
       m!==null ? (m*(r.salary_months||12)/10).toFixed(1) : '',
       [r.city,r.district].filter(Boolean).join('·'),
       r.experience, r.education, (r.skills||[]).join(' / '), (r.welfare||[]).join(' / '),
-      r.status||'', r.note||'', r.url, r.fetched_at].map(q).join(','));
+      r.status||'', r.note||'', r.url, r.fetched_at, seenAt(r)].map(q).join(','));
   });
   const blob = new Blob(['\\ufeff'+lines.join('\\n')], {type:'text/csv;charset=utf-8'});
   const a = document.createElement('a');
@@ -658,7 +868,7 @@ function exportCSV(){
   a.click();
 }
 
-__COLLECT_SCRIPT____DETAIL_SCRIPT____STATUS_SCRIPT__buildUI();
+__COLLECT_SCRIPT____DETAIL_SCRIPT____STATUS_SCRIPT____DELETE_SCRIPT__buildUI();
 apply();__BOOT_HOOK__
 </script>
 </body>
@@ -677,7 +887,7 @@ WEB_COLLECT_PANEL = """
       <option value="zhitong">智通直聘</option>
     </select>
     <select id="c-city">__CITY_OPTIONS__</select>
-    <input type="text" id="c-kw" class="kw" placeholder="关键词，如 python">
+    <input type="text" id="c-kw" class="kw" placeholder="关键词，用长词（python开发）">
     <span class="hint">页数</span>
     <input type="number" id="c-pages" min="1" max="10" value="3">
     <button id="btn-collect">开始采集</button>
@@ -800,6 +1010,17 @@ async function resumeTask(){
 """
 
 DETAIL_TH = "<th>正文</th>"
+DELETE_TH = "<th>删</th>"
+
+# 批量删除放在筛选条下面：要删的永远是"刚筛出来的这一批"，条件也只用说一次
+DELETE_BAR = """  <div class="row">
+    <button class="ghost" id="btn-del-filtered">删除当前筛选出的职位</button>
+    <span class="hint">删的只是本机库里的记录，不会访问任何平台，也不影响你已经投出去的申请</span>
+  </div>
+  <div class="row" id="undo-bar" style="display:none">
+    <span class="hint" id="undo-text"></span>
+    <button class="ghost" id="btn-undo">撤销这次删除</button>
+  </div>"""
 
 STATUS_JS = """// ---- 投递状态：只是把"我投没投、面得怎么样"记在本地库，不发任何平台请求 ----
 function bindStatus(){
@@ -848,6 +1069,20 @@ function bindDetails(){
   document.querySelectorAll('[data-det]').forEach(b => {
     b.onclick = () => toggleDetail(b);
   });
+  document.querySelectorAll('[data-xref]').forEach(b => { b.onclick = () => toggleXref(b); });
+  bindXdet(document);
+}
+
+// 对照面板里的那颗正文按钮：只在这一项下面就地展开，不再插整行（列数不变）。
+// 面板是点标签之后才建出来的，所以绑定时机得跟着走，不能只绑一次 renderTable。
+function bindXdet(scope){
+  scope.querySelectorAll('[data-xdet]').forEach(b => {
+    b.onclick = () => {
+      const box = b.closest('.xref-item').querySelector('.xref-det');
+      if (box.childElementCount) { box.innerHTML = ''; b.textContent = '看正文'; return; }
+      showDetail(b, box);
+    };
+  });
 }
 
 function renderDetail(cell, d, note){
@@ -881,10 +1116,53 @@ async function toggleDetail(btn){
   const row = document.createElement('tr');
   row.className = 'det-row';
   const cell = document.createElement('td');
-  cell.colSpan = 11;
+  cell.colSpan = 14;
   row.appendChild(cell);
   tr.after(row);
+  // 这条通道拿不到正文：把原因就地说明白，不发请求、不占今日正文额度
+  if (btn.dataset.nd) { cell.textContent = btn.dataset.nd; return; }
   await showDetail(btn, cell);
+}
+
+// 对照面板：这一行的数据早就在 DATA 里，纯本地拼出来，一个请求都不发
+function toggleXref(btn){
+  const tr = btn.closest('tr');
+  const next = tr.nextElementSibling;
+  if (next && next.classList.contains('det-row')) { next.remove(); return; }
+  document.querySelectorAll('tr.det-row').forEach(x => x.remove());
+  const row = document.createElement('tr');
+  row.className = 'det-row';
+  const cell = document.createElement('td');
+  cell.colSpan = 14;
+  cell.appendChild(renderXref(+btn.dataset.xref));
+  row.appendChild(cell);
+  tr.after(row);
+}
+
+function renderXref(id){
+  const r = DATA.find(x => x.id === id);
+  const box = document.createElement('div');
+  box.className = 'det-wrap';
+  box.innerHTML = `<div class="hint">按归一后的公司名和职位名对上的另一些职位。`
+    + `对不上不代表别处没有；投哪条看的是这两条各自写的薪资和要求，不是"哪个平台更正规"。</div>`;
+  (r.cross || []).forEach(x => {
+    const item = document.createElement('div');
+    item.className = 'xref-item';
+    const u = safeUrl(x.url);
+    const key = x.platform + ':' + x.platform_job_id;
+    const nd = NO_DETAIL[x.platform] || '';
+    item.innerHTML = `<span class="plat-badge p-${esc(x.platform)}">${esc(PNAME[x.platform]||x.platform)}</span>`
+      + `<span>${u ? `<a href="${esc(u)}" target="_blank" rel="noopener">在原页看</a>` : '（没留链接）'}</span>`
+      + `<span>薪资 ${esc(x.salary_raw||'—')}</span><span>${esc(x.city||'没写城市')}</span>`
+      + `<span class="hint">最近见到 ${esc(x.seen||'—')}</span>`
+      + (nd ? `<span class="hint">${esc(nd)}</span>`
+            : `<button class="chip" data-xdet="1" data-id="${esc(x.id)}" data-key="${esc(key)}">`
+              + `${(x.has_detail || DET.has(key)) ? '看正文' : '抓正文'}</button>`)
+      + `<div class="xref-det"></div>`;
+    box.appendChild(item);
+  });
+  bindXdet(box);
+  return box;
 }
 
 async function showDetail(btn, cell){
@@ -913,17 +1191,100 @@ async function showDetail(btn, cell){
 
 """
 
+DELETE_JS = """// ---- 删除：只动本机库里的记录，不发任何平台请求，也不撤销投递 ----
+let undoBatch = null;
+
+function sayUndo(text, canUndo){
+  const bar = document.getElementById('undo-bar');
+  document.getElementById('undo-text').textContent = text;
+  bar.style.display = 'flex';
+  document.getElementById('btn-undo').style.display = canUndo ? '' : 'none';
+}
+
+function describe(rs){
+  const names = rs.slice(0, 10).map(r =>
+    '· ' + (r.title || '（没标题）') + '｜' + (r.company || '没写公司') + '｜' + (r.city || '没写城市'));
+  return names.join('\\n') + (rs.length > 10 ? '\\n… 一共 ' + rs.length + ' 条' : '');
+}
+
+function bindDelete(){
+  document.querySelectorAll('[data-del]').forEach(b =>
+    b.onclick = () => askDelete([b.dataset.del]));
+  document.getElementById('btn-del-filtered').onclick =
+    () => askDelete(st.filtered.map(r => String(r.id)));
+  document.getElementById('btn-undo').onclick = undoDelete;
+}
+
+async function askDelete(ids){
+  if (!ids.length) { sayUndo('当前筛选结果里没有职位。', false); return; }
+  if (ids.length > 500) { sayUndo('一次最多删 500 条，请收紧筛选条件分批来。', false); return; }
+  const rs = ids.map(i => DATA.find(r => String(r.id) === String(i))).filter(Boolean);
+  const head = ids.length === 1 ? '从本地库删掉这一条？'
+                                 : '删掉当前筛选出的 ' + ids.length + ' 条？';
+  // 确认框里必须点名是哪几条：批量删最容易出的错是"我以为我筛对了"
+  if (!confirm(head + '\\n\\n' + describe(rs) + '\\n\\n'
+        + '这只删本机 data/jobs.db 里的记录，不会访问任何招聘平台，'
+        + '也不影响你已经投出去的申请。\\n正文和匹配度会一起清掉，删完可以在本页撤销一次。')) return;
+  try {
+    const r = await api('/api/delete', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ids: ids.map(Number)})});
+    const gone = new Set(ids.map(String));
+    DATA = DATA.filter(x => !gone.has(String(x.id)));
+    undoBatch = r.batch || null;
+    apply();
+    sayUndo('已删除 ' + r.deleted + ' 条'
+      + (r.details ? '（连带 ' + r.details + ' 条正文）' : '')
+      + (r.analysis ? '、' + r.analysis + ' 条匹配度' : '') + '。', !!undoBatch);
+  } catch (e) {
+    sayUndo('删除失败：' + e.message, false);
+  }
+}
+
+async function undoDelete(){
+  if (!undoBatch) return;
+  try {
+    const r = await api('/api/restore', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({batch: undoBatch})});
+    undoBatch = null;
+    await refreshData();
+    sayUndo('已撤销，放回 ' + r.jobs + ' 条职位'
+      + (r.details ? '、' + r.details + ' 条正文' : '')
+      + (r.analysis ? '、' + r.analysis + ' 条匹配度' : '') + '。', false);
+  } catch (e) {
+    sayUndo('撤销失败：' + e.message, true);
+  }
+}
+
+// 页面重开了也还能撤销：批次记在服务端的 data/trash 里，不靠浏览器存数据
+async function loadTrash(){
+  try {
+    const r = await api('/api/trash');
+    const b = (r.batches || [])[0];
+    if (!b) return;
+    undoBatch = b.batch;
+    sayUndo('上次删掉了 ' + b.jobs + ' 条（' + b.deleted_at + '），这一批还能撤销。', true);
+  } catch (e) {}
+}
+
+"""
+
 SLOT_RE = re.compile("|".join(map(re.escape, (
     "__COLLECT_PANEL__", "__COLLECT_SCRIPT__", "__DETAIL_SCRIPT__", "__STATUS_SCRIPT__",
-    "__STATUS_CONSTS__", "__CITY_OPTIONS__",
+    "__DELETE_TH__", "__DELETE_BAR__", "__DELETE_SCRIPT__",
+    "__STATUS_CONSTS__", "__CITY_OPTIONS__", "__STALE_DAYS__", "__NO_DETAIL__",
+    "__NO_LIST_SKILLS__",
     "__GENERATED_AT__", "__SUB_LINE__", "__BOOT_HOOK__", "__TOKEN__", "__DATA__",
     "__N__", "__IS_WEB__", "__DETAIL_TH__"))))
 
 
 def _filter_html(sub_line: str, records: list[dict], *, web: bool,
-                 token: str = "", city_opts_html: str = "") -> str:
+                 token: str = "", city_opts_html: str = "",
+                 no_detail: dict | None = None) -> str:
     n = str(len(records))
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    # 跨平台对照是读取侧算出来的：库里没这一列，导出 CSV 也不带，只有页面用
+    crossref.attach(records)
     slots = {
         "__SUB_LINE__": sub_line.replace("__GENERATED_AT__", ts).replace("__N__", n),
         "__GENERATED_AT__": ts,
@@ -935,19 +1296,30 @@ def _filter_html(sub_line: str, records: list[dict], *, web: bool,
         "__COLLECT_SCRIPT__": WEB_COLLECT_SCRIPT if web else "",
         "__DETAIL_SCRIPT__": DETAIL_JS if web else "",
         "__DETAIL_TH__": DETAIL_TH if web else "",
+        "__DELETE_SCRIPT__": DELETE_JS if web else "",
+        "__DELETE_TH__": DELETE_TH if web else "",
+        "__DELETE_BAR__": DELETE_BAR if web else "",
         "__STATUS_SCRIPT__": STATUS_JS if web else "",
-        "__STATUS_CONSTS__": "const STATUS = {}; const NOTE_MAX = {};".format(
-            _embed_json(list(db.STATUS_LABELS)), db.NOTE_MAX),
+        "__STATUS_CONSTS__": ("const STATUS = {}; const NOTE_MAX = {}; const EXP_ORDER = {}; "
+                              "const EDU_ORDER = {};").format(
+            _embed_json(list(db.STATUS_LABELS)), db.NOTE_MAX,
+            _embed_json(list(tag_rules.EXP_BUCKETS)), _embed_json(list(tag_rules.EDU_BUCKETS))),
+        "__STALE_DAYS__": str(STALE_AFTER_DAYS),
+        # 正文能力是逐平台的：服务版给出"为什么拿不到"，静态版没有正文按钮，给空表就行
+        "__NO_DETAIL__": _embed_json(no_detail or {}),
+        # 技能列的来源同样逐平台：这一份两版都要用，静态版也得说清谁的列表页没有技能
+        "__NO_LIST_SKILLS__": _embed_json(tag_rules.NO_LIST_SKILLS),
         "__IS_WEB__": "true" if web else "false",
-        "__BOOT_HOOK__": "\nresumeTask(); loadDetailKeys();" if web else "",
+        "__BOOT_HOOK__": "\nresumeTask(); loadDetailKeys(); loadTrash();" if web else "",
     }
     # 单次扫描替换：值里若含占位符字面量也不会被二次展开
     return re.sub(SLOT_RE, lambda m: slots[m.group(0)], FILTER_TEMPLATE)
 
 
-def render_web(records: list[dict], token: str, city_opts_html: str = "") -> str:
+def render_web(records: list[dict], token: str, city_opts_html: str = "",
+               no_detail: dict | None = None) -> str:
     return _filter_html(WEB_SUB_LINE, records, web=True, token=token,
-                        city_opts_html=city_opts_html)
+                        city_opts_html=city_opts_html, no_detail=no_detail)
 
 
 def generate_browser(out_path: Path | None = None, demo: bool = False) -> Path:

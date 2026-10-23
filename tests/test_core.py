@@ -2,12 +2,16 @@
 
 运行：python -m unittest discover -s tests -v
 """
+import io
 import json
+import os
 import re
+import socket
 import sys
 import tempfile
+import time
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -15,13 +19,19 @@ from playwright.sync_api import Error as PlaywrightError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from jobstats import browser, config, db, details, html_text, report, skills
+from jobstats import (analyze, browser, config, crossref, db, details, html_text,
+                      relevance, report, server, skills)
+from jobstats import collectors
 from jobstats.collectors import boss
+
+import cli  # noqa: E402  status 自检那几个函数住在这里
 
 SLOT_NAMES = ("__SUB_LINE__", "__GENERATED_AT__", "__N__", "__DATA__", "__TOKEN__",
               "__CITY_OPTIONS__", "__COLLECT_PANEL__", "__COLLECT_SCRIPT__", "__BOOT_HOOK__",
               "__DETAIL_SCRIPT__", "__DETAIL_TH__", "__IS_WEB__",
-              "__STATUS_SCRIPT__", "__STATUS_CONSTS__")
+              "__STATUS_SCRIPT__", "__STATUS_CONSTS__", "__STALE_DAYS__", "__NO_DETAIL__",
+              "__NO_LIST_SKILLS__",
+              "__DELETE_TH__", "__DELETE_BAR__", "__DELETE_SCRIPT__")
 
 
 def make_record(**over):
@@ -67,6 +77,22 @@ class TestParseSalary(unittest.TestCase):
             with self.subTest(raw=raw):
                 self.assertIsNone(db.parse_salary(raw))
 
+    def test_single_value_keeps_floor_and_ceiling_equal(self):
+        """平台只给一个数时不猜上限：上下限都按下限记，均值统计才不会被凭空抬高。"""
+        for raw, expected in (("15K", (15.0, 15.0, 12)), ("15K以上", (15.0, 15.0, 12)),
+                              ("1.5万", (15.0, 15.0, 12)), ("8千", (8.0, 8.0, 12)),
+                              ("20K·13薪", (20.0, 20.0, 13))):
+            with self.subTest(raw=raw):
+                self.assertEqual(db.parse_salary(raw), expected)
+
+    def test_unitless_numbers_are_read_by_magnitude(self):
+        """'3000-5000' 是元不是 K——旧实现按 K 处理会得出 300 万/月。"""
+        for raw, expected in (("3000-5000", (3.0, 5.0, 12)),
+                              ("8-12", (8.0, 12.0, 12)),
+                              ("12000-15000", (12.0, 15.0, 12))):
+            with self.subTest(raw=raw):
+                self.assertEqual(db.parse_salary(raw), expected)
+
 
 class TestSkills(unittest.TestCase):
     """三家平台往技能列里塞的东西口径不同，读取前必须归一。"""
@@ -99,6 +125,127 @@ class TestSkills(unittest.TestCase):
     def test_welfare_detector_for_tags_smuggled_into_skills(self):
         self.assertTrue(skills.is_welfare("包吃包住"))
         self.assertFalse(skills.is_welfare("Python"))
+
+
+# 2026-10-14 从 data/jobs.db 里数出来的 47 种原文（同一个要求三家各写各的）。
+# 归一测试用真实写法当输入，不自己编——编出来的样本永远命中不了 `经验经验不限` 这种。
+REAL_EXP_WORDS = (
+    "经验经验不限", "3年及以上", "经验3年及以上", "3-5年", "1年及以上", "1-3年",
+    "经验5年及以上", "经验3-10年", "5-10年", "经验2年及以上", "无需经验", "经验3年",
+    "2年及以上", "5年及以上", "经验5-10年", "经验2-10年", "经验3-5年", "经验1年及以上",
+    "经验1年", "经验不限", "经验1-3年", "在校/应届", "经验2年", "应届毕业生及以上",
+    "经验8年及以上", "经验4年及以上", "应届毕业生-2年", "经验2-3年", "1年", "1年以内",
+    "1-5年", "10年以上", "经验4-10年", "应届毕业生-3年", "经验1-10年", "在读学生-应届毕业生",
+    "1-2年", "3年", "2年", "经验2-5年", "经验5年", "经验5-8年", "经验6年", "经验2-4年",
+    "应届毕业生-1年", "应届毕业生", "经验3-8年")
+
+
+class TestLabelBuckets(unittest.TestCase):
+    """经验/学历归一：47 种经验写法必须收进 7 档，归档只看下限。"""
+
+    def test_real_wordings_all_land_in_a_bucket(self):
+        self.assertEqual(len(REAL_EXP_WORDS), 47)
+        got = {skills.exp_bucket(w) for w in REAL_EXP_WORDS}
+        self.assertLessEqual(len(got), 7, got)
+        self.assertFalse(got - set(skills.EXP_BUCKETS), got - set(skills.EXP_BUCKETS))
+        self.assertNotIn("其他", got)     # 这 47 种里没有落不进档的
+        self.assertNotIn("未标注", got)
+
+    def test_bucketed_by_the_floor_not_the_ceiling(self):
+        for raw, want in (("3-5年", "3-5年"), ("3年及以上", "3-5年"), ("经验3-10年", "3-5年"),
+                          ("经验2-10年", "1-3年"), ("经验5-8年", "5-10年"),
+                          ("1年及以上", "1-3年"), ("经验1年", "1-3年")):
+            with self.subTest(raw=raw):
+                self.assertEqual(skills.exp_bucket(raw), want)
+
+    def test_upper_bound_wording_is_not_read_as_a_floor(self):
+        self.assertEqual(skills.exp_bucket("1年以内"), "1年以内")
+        self.assertEqual(skills.exp_bucket("经验1年以内"), "1年以内")
+        self.assertEqual(skills.exp_bucket("3年以下"), "1-3年")
+        # "以上"不是上限说法，别被上面那条 `以下` 规则误伤（`10年以上` 是 10 年以上）
+        self.assertEqual(skills.exp_bucket("10年以上"), "10年以上")
+
+    def test_no_limit_and_student_wordings_merge(self):
+        for raw in ("经验不限", "经验经验不限", "无需经验"):
+            self.assertEqual(skills.exp_bucket(raw), "经验不限", raw)
+        for raw in ("在校/应届", "应届毕业生-2年", "在读学生-应届毕业生", "应届毕业生及以上"):
+            self.assertEqual(skills.exp_bucket(raw), "应届/在校", raw)
+
+    def test_blank_and_unparseable_experience(self):
+        self.assertEqual(skills.exp_bucket(""), "未标注")
+        self.assertEqual(skills.exp_bucket(None), "未标注")
+        self.assertEqual(skills.exp_bucket("面议"), "其他")
+
+    def test_education_variants_merged(self):
+        for raw, want in (("本科", "本科"), ("学士", "本科"), ("大专", "大专"), ("专科", "大专"),
+                          ("中专", "高中/中专"), ("中专/中技", "高中/中专"),
+                          ("中技/中专", "高中/中专"), ("高中", "高中/中专"),
+                          ("职高", "高中/中专"), ("学历不限", "学历不限"), ("不限", "学历不限"),
+                          ("硕士", "硕士及以上"), ("研究生", "硕士及以上"), ("博士", "硕士及以上"),
+                          ("初中及以下", "初中及以下"), ("", "未标注"), ("面议", "其他")):
+            with self.subTest(raw=raw):
+                self.assertEqual(skills.edu_bucket(raw), want)
+
+    def test_bucket_lists_are_the_short_ones_we_promised(self):
+        self.assertEqual([b for b in skills.EXP_BUCKETS if b not in ("未标注", "其他")],
+                         ["经验不限", "应届/在校", "1年以内", "1-3年", "3-5年", "5-10年", "10年以上"])
+        self.assertEqual([b for b in skills.EDU_BUCKETS if b not in ("未标注", "其他")],
+                         ["学历不限", "初中及以下", "高中/中专", "大专", "本科", "硕士及以上"])
+
+    def test_bucketing_is_idempotent_over_raw_fields(self):
+        rec = {"experience": "经验3年及以上", "education": "中专/中技"}
+        skills.add_buckets(skills.add_buckets(rec))
+        self.assertEqual(rec["experience"], "经验3年及以上")   # 原文一个字没改
+        self.assertEqual(rec["experience_bucket"], "3-5年")
+        self.assertEqual(rec["education_bucket"], "高中/中专")
+
+
+class TestBucketPlumbing(TempDbCase):
+    def test_fetch_all_carries_buckets_next_to_the_raw_text(self):
+        db.save_jobs([make_record(experience="经验3年及以上", education="中专/中技")])
+        row = db.fetch_all()[0]
+        self.assertEqual(row["experience"], "经验3年及以上")
+        self.assertEqual(row["experience_bucket"], "3-5年")
+        self.assertEqual(row["education_bucket"], "高中/中专")
+
+    def test_csv_export_still_writes_platform_wording(self):
+        db.save_jobs([make_record(experience="经验3年及以上")])
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "e.csv"
+            db.export_csv(out)
+            text = out.read_text(encoding="utf-8-sig")
+        self.assertIn("经验3年及以上", text)
+        self.assertEqual(text.splitlines()[0].split(","), db.EXPORT_FIELDS)
+
+    def test_stats_charts_count_buckets_not_raw_wordings(self):
+        recs = [make_record(experience=w, education=e)
+                for w, e in (("3年及以上", "本科"), ("经验3-10年", "中专/中技"), ("3-5年", "本科"))]
+        stats = report.build_stats(recs)
+        self.assertEqual(dict(stats["experiences"])["3-5年"], 3)
+        self.assertEqual(dict(stats["educations"])["本科"], 2)
+        self.assertNotIn("经验3-10年", dict(stats["experiences"]))
+
+    def test_page_chips_are_driven_by_buckets_with_raw_in_tooltip(self):
+        rec = skills.add_buckets(make_record(experience="经验3年及以上"))
+        html = report.render_web([rec], "T", "")
+        for needle in ("const EXP_ORDER = ", "const EDU_ORDER = ",
+                       "chip('experience_bucket', 'experience', 'exp'",
+                       "chip('education_bucket', 'education', 'edu'",
+                       "bucketTd(r.experience_bucket, r.experience)",
+                       "经验3年及以上", "3-5年"):
+            self.assertIn(needle, html)
+
+    def test_row_cells_line_up_with_the_header(self):
+        """bucketTd 自己就带 <td>，再套一层就整行串列（这次真踩到了）。列数对不上就报错。"""
+        row = re.search(r"return `<tr>(.*?)</tr>`;", report.FILTER_TEMPLATE, re.S).group(1)
+        whole_cells = ("fetchedTd}", "seenTd}", "stCell}", "scoreCell}", "det}", "delCell}",
+                       "skillTd}")
+        cells = (row.count("<td") + row.count("bucketTd(")
+                 + sum(row.count(x) for x in whole_cells))
+        self.assertEqual(14, cells, "网页版 14 列：静态页去掉『正文』『删』两列 = 12")
+        self.assertNotIn("<td>${bucketTd", report.FILTER_TEMPLATE)
+        self.assertNotIn("<td>${seenTd", report.FILTER_TEMPLATE)
+        self.assertNotIn("<td>${skillTd", report.FILTER_TEMPLATE)
 
 
 class TestSaveJobs(TempDbCase):
@@ -170,6 +317,71 @@ class TestSaveJobs(TempDbCase):
         self.assertEqual(db.annual_wan({"salary_min": 10.0, "salary_max": 20.0}), 18.0)
         self.assertIsNone(db.annual_wan({"salary_min": None, "salary_max": 20.0}))
         self.assertIsNone(db.annual_wan({"salary_min": 10.0, "salary_max": None}))
+
+
+class TestRecollectRefresh(TempDbCase):
+    """同一个职位第二次采到时的行为：刷新平台字段，但别动我自己的标注和额度。"""
+
+    def test_refresh_updates_salary_but_keeps_my_marks(self):
+        db.save_jobs([make_record()])
+        row = db.fetch_all()[0]
+        db.set_status(row["id"], "已投", "已聊过 HR")
+        st = db.save_stats([make_record(salary_raw="18-30K", salary_min=18.0,
+                                        salary_max=30.0)])
+        self.assertEqual((st["added"], st["refreshed"]), (0, 1))
+        r = db.fetch_all()[0]
+        self.assertEqual((r["salary_min"], r["salary_max"]), (18.0, 30.0))
+        self.assertEqual((r["status"], r["note"]), ("已投", "已聊过 HR"))
+
+    def test_refresh_does_not_burn_the_daily_quota(self):
+        """额度按 fetched_at 计：fetched_at 是"第一次采到"，刷新时不该往后推。"""
+        db.save_jobs([make_record()])
+        before = db.fetch_all()[0]
+        db.save_jobs([make_record(salary_raw="30-40K")])
+        after = db.fetch_all()[0]
+        self.assertEqual(after["fetched_at"], before["fetched_at"])
+        self.assertEqual(db.count_today(), 1)
+
+    def test_empty_values_do_not_erase_what_we_already_had(self):
+        """列表页经常不给行业/规模/技能，照直刷会把详情里拿到的抹平。"""
+        db.save_jobs([make_record()])
+        db.save_jobs([make_record(industry="", company_scale="", skills=[],
+                                  welfare=[], salary_raw="", district="")])
+        r = db.fetch_all()[0]
+        self.assertEqual(r["industry"], "互联网")
+        self.assertEqual(r["company_scale"], "100-499人")
+        self.assertEqual(r["salary_raw"], "15-25K·14薪")
+        self.assertEqual(r["district"], "南山")
+        self.assertEqual(r["skills"], ["Python", "Django"])
+
+    def test_new_job_gets_both_timestamps(self):
+        db.save_jobs([make_record()])
+        r = db.fetch_all()[0]
+        self.assertEqual(r["last_seen_at"], r["fetched_at"])
+
+    def test_old_database_gets_the_column_backfilled(self):
+        """老库（没有 last_seen_at 那列）打开后要补列并回填，不能一片空白。"""
+        import sqlite3
+        db.save_jobs([make_record()])
+        old = db.DB_PATH
+        conn = sqlite3.connect(old)
+        try:
+            conn.execute("ALTER TABLE jobs RENAME TO jobs_old")
+            # 2026-10 之前的表结构：没有 last_seen_at，也没有屏蔽名单
+            conn.execute("CREATE TABLE jobs AS SELECT id, platform, platform_job_id, title,"
+                         " company, salary_raw, salary_min, salary_max, salary_months, city,"
+                         " district, experience, education, industry, company_scale, skills,"
+                         " welfare, url, fetched_at, status, note FROM jobs_old")
+            conn.execute("DROP TABLE jobs_old")
+            conn.execute("DROP TABLE blocked_jobs")
+            conn.commit()
+        finally:
+            conn.close()
+        db.init_db()
+        rows = db.fetch_all()
+        self.assertEqual(len(rows), 1)
+        self.assertIsNotNone(rows[0]["last_seen_at"])
+        self.assertEqual(db.save_stats([make_record()])["refreshed"], 1)
 
 
 class TestDailyCap(TempDbCase):
@@ -450,9 +662,37 @@ class TestEdgeChannel(unittest.TestCase):
 
     def test_attach_refuses_without_window(self):
         with mock.patch.object(browser, "cdp_alive", lambda port=0: False):
-            with self.assertRaises(RuntimeError):
-                with browser.attach():
+            with self.assertRaises(RuntimeError) as cm:
+                with browser.attach(relaunch=lambda: None):
                     self.fail("不该进入上下文")
+        self.assertIn("login boss --edge", str(cm.exception))
+
+    def test_attach_reopens_window_itself_when_it_was_closed(self):
+        """窗口被随手关掉是常态：自己弹回来，别一上来就叫用户去敲命令。"""
+        state = {"alive": False, "tried": 0}
+
+        def relaunch():
+            state["tried"] += 1
+            state["alive"] = True
+
+        with mock.patch.object(browser, "cdp_alive", lambda port=0: state["alive"]), \
+             mock.patch.object(browser, "sync_playwright") as sp:
+            # p = sync_playwright().start() → p.chromium.connect_over_cdp(...) → p.contexts[0]
+            sp.return_value.start.return_value.chromium \
+                .connect_over_cdp.return_value.contexts = ["ctx"]
+            with mock.patch("builtins.print"):
+                with browser.attach(relaunch=relaunch) as ctx:
+                    self.assertEqual(ctx, "ctx")
+        self.assertEqual(state["tried"], 1)
+
+    def test_attach_reports_reopen_failure_without_leaking_stack(self):
+        boom = RuntimeError("Edge 调试端口 9223 起不来\nCall log: cookie: bst=SECRET")
+        with mock.patch.object(browser, "cdp_alive", lambda port=0: False):
+            with self.assertRaises(RuntimeError) as cm:
+                with browser.attach(relaunch=lambda: (_ for _ in ()).throw(boom)):
+                    self.fail("不该进入上下文")
+        self.assertIn("自动恢复失败", str(cm.exception))
+        self.assertNotIn("SECRET", str(cm.exception))
 
 
 class TestLoginState(unittest.TestCase):
@@ -492,7 +732,364 @@ class TestLoginState(unittest.TestCase):
         self.assertTrue(self.storage.exists())
 
 
-def zt_item(jid="12406875", poskey="TdFLo0K2", **over):
+class TestAuthDirLocation(unittest.TestCase):
+    """登录凭证默认在项目外（%LOCALAPPDATA%\\job-stats\\auth），可由 JOBSTATS_AUTH_DIR 改。"""
+
+    def _reload(self):
+        import importlib
+        importlib.reload(config)
+        return config.AUTH_DIR
+
+    def _with_env(self, value):
+        prev = os.environ.get("JOBSTATS_AUTH_DIR")
+        if value is None:
+            os.environ.pop("JOBSTATS_AUTH_DIR", None)
+        else:
+            os.environ["JOBSTATS_AUTH_DIR"] = value
+        try:
+            return self._reload()
+        finally:
+            if prev is None:
+                os.environ.pop("JOBSTATS_AUTH_DIR", None)
+            else:
+                os.environ["JOBSTATS_AUTH_DIR"] = prev
+            self._reload()
+
+    def test_default_is_outside_the_project(self):
+        """项目文件夹里任何时候都不该有登录凭证：挪回 data/ 就等于把外传风险请回来。"""
+        d = self._with_env(None)
+        self.assertEqual(d, config.CDP_PROFILE_DIR.parent / "auth")
+        self.assertNotIn(config.PROJECT_DIR, d.parents)
+
+    def test_env_var_wins(self):
+        self.assertEqual(self._with_env(r"D:\secrets\jobstats-auth"),
+                         Path(r"D:\secrets\jobstats-auth"))
+
+    def test_blank_env_var_does_not_move_it_to_cwd(self):
+        """设成空串或纯空格等于没设——Path('') 会变成当前目录，那就邪门了。"""
+        self.assertEqual(self._with_env("   "), config.CDP_PROFILE_DIR.parent / "auth")
+
+    def test_login_messages_print_the_real_path(self):
+        """话术里不能写死 data/auth：挪了地址还那么说，人就照着错的地方找。"""
+        src = (Path(config.PROJECT_DIR) / "jobstats" / "browser.py").read_text(encoding="utf-8")
+        self.assertNotIn("已保存到 data/auth/", src)
+        self.assertIn("登录凭证存放地址", src)
+
+
+class TestLoginStateReport(unittest.TestCase):
+    """`cli.py status` 的底层：只凭 cookie 名字和有效期下结论，值一个字节都不许出现在返回值里。"""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.auth = Path(tmp.name)
+        self._patch = mock.patch.object(browser, "AUTH_DIR", self.auth)
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+
+    def _write(self, cookies):
+        (self.auth / "boss_storage.json").write_text(
+            json.dumps({"cookies": cookies}), encoding="utf-8")
+
+    def _report(self, required=("bst", "zp_at")):
+        return "\n".join(browser.login_state_report("boss", set(required)))
+
+    def test_missing_file_tells_you_to_scan(self):
+        out = self._report()
+        self.assertIn("还没保存过登录态", out)
+        self.assertIn("login-boss.bat", out)
+
+    def test_expired_cookie_says_rescan_not_retry_the_command(self):
+        now = time.time()
+        self._write([{"name": "bst", "value": "SECRET-BST-VALUE", "expires": now - 86400 * 9},
+                     {"name": "zp_at", "value": "SECRET-ZP-VALUE", "expires": now + 86400 * 3}])
+        out = self._report()
+        self.assertIn("bst: 已过期 9.0 天", out)
+        self.assertIn("zp_at: 还剩 3.0 天", out)
+        self.assertIn("重新扫一次码才是正解", out)
+
+    def test_cookie_values_never_reach_the_report(self):
+        """返回值是要打印的，混进值等于把登录凭证贴到屏幕上、写进日志里。"""
+        self._write([{"name": "bst", "value": "SECRET-BST-VALUE", "expires": time.time() + 86400},
+                     {"name": "zp_at", "value": "SECRET-ZP-VALUE", "expires": -1}])
+        self.assertNotIn("SECRET", self._report())
+
+    def test_session_cookie_is_not_reported_as_expired(self):
+        self._write([{"name": "bst", "value": "v1", "expires": -1},
+                     {"name": "zp_at", "value": "v2"}])
+        out = self._report()
+        self.assertNotIn("已过期", out)
+        self.assertIn("看不出有效期", out)
+
+    def test_absent_login_cookie_is_called_anonymous(self):
+        """只有 __a/lastCity 这类匿名 cookie 时，文件在但不能当登录态用。"""
+        self._write([{"name": "__a", "value": "v", "expires": time.time() + 86400}])
+        out = self._report()
+        self.assertIn("bst: 没有", out)
+        self.assertIn("匿名访问", out)
+
+    def test_platform_without_login_need_says_so(self):
+        out = self._report(required=())
+        self.assertIn("不需要登录凭证", out)
+
+    # 影刀那套登录巡检（README「影刀：每天早上的登录巡检」）不查库、不看退出码，
+    # 只在这段中文里匹配下面几个词：命中就发消息，一个都不命中就算健康。
+    # 所以这几个词是接口——文案随手一改，巡检就变成天天误报或者永远不报。
+    RPA_BAD = ("已过期", "还没保存过登录态", "判据缺失", "看不出有效期")
+
+    def test_healthy_state_matches_no_rpa_phrase(self):
+        now = time.time()
+        self._write([{"name": "bst", "value": "v1", "expires": now + 86400 * 5},
+                     {"name": "zp_at", "value": "v2", "expires": now + 86400 * 5}])
+        out = self._report()
+        self.assertIn("还剩 5.0 天", out)
+        for phrase in self.RPA_BAD:
+            self.assertNotIn(phrase, out)
+
+    def test_every_broken_state_matches_an_rpa_phrase(self):
+        """四种坏状态都得被那几个词逮住，漏一种就是那种情况下它一声不响。"""
+        now = time.time()
+        cases = {
+            "文件不在": None,
+            "凭证过期": [{"name": "bst", "value": "v", "expires": now - 86400},
+                         {"name": "zp_at", "value": "v", "expires": now + 86400}],
+            "只有匿名 cookie": [{"name": "__a", "value": "v", "expires": now + 86400}],
+            "会话 cookie": [{"name": "bst", "value": "v", "expires": -1},
+                            {"name": "zp_at", "value": "v", "expires": -1}],
+        }
+        for label, cookies in cases.items():
+            with self.subTest(label):
+                if cookies is None:
+                    (self.auth / "boss_storage.json").unlink(missing_ok=True)
+                else:
+                    self._write(cookies)
+                out = self._report()
+                self.assertTrue([p for p in self.RPA_BAD if p in out], f"{label}：{out}")
+
+
+class TestTaskLogFile(TempDbCase):
+    """页面里的采集日志必须落盘：服务一重启，昨晚那次为什么 0 条就该再也查不到了。
+
+    继承 TempDbCase 是因为这两个用例会真的跑 `TaskManager._run`，整条落库链路都在里面：
+    只 patch `init_db`/`save_jobs` 挡不住后来加在 collect_and_save 里的采集留痕写盘。
+    """
+
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.logdir = Path(tmp.name)
+        patch = mock.patch.object(server, "LOG_DIR", self.logdir)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def _today(self):
+        return self.logdir / f"collect-{time.strftime('%Y-%m-%d')}.log"
+
+    def test_log_lines_reach_the_file_with_task_identity(self):
+        task = server.CollectTask("zhitong", "IT运维", "东莞", 3)
+        task.log("第 1/3 页: IT运维 @ 东莞")
+        text = self._today().read_text(encoding="utf-8")
+        self.assertIn("[zhitong]", text)
+        self.assertIn(task.id, text)
+        self.assertIn("第 1/3 页", text)
+
+    def test_failure_line_is_truncated_so_cookies_stay_out(self):
+        """Playwright 的报错第二行原样带着请求头，日志文件里只能有第一行。"""
+        boom = PlaywrightError("APIRequestContext.get: Request context disposed.\n"
+                               "  - Cookie: bst=SECRET-BST-VALUE; zp_at=SECRET-ZP")
+        fake = mock.Mock()
+        fake.collect.side_effect = boom
+        task = server.CollectTask("boss", "IT", "东莞", 1)
+        with mock.patch.dict(server.COLLECTORS, {"boss": fake}):
+            server.TaskManager()._run(task)
+        text = self._today().read_text(encoding="utf-8")
+        self.assertIn("[失败] APIRequestContext.get", text)
+        self.assertNotIn("SECRET", text)
+        self.assertNotIn("SECRET", task.error or "")
+
+    def test_start_and_done_lines_are_written(self):
+        fake = mock.Mock()
+        fake.PER_PAGE_SAVE = False       # 老通道：整轮跑完由调用方存一次
+        fake.collect.return_value = [{"platform_job_id": "1"}]
+        task = server.CollectTask("zhitong", "IT", "东莞", 2)
+        with mock.patch.dict(server.COLLECTORS, {"zhitong": fake}), \
+             mock.patch.object(server.db, "init_db"), \
+             mock.patch.object(server.db, "save_jobs", return_value=1):
+            server.TaskManager()._run(task)
+        text = self._today().read_text(encoding="utf-8")
+        self.assertIn("开始：zhitong", text)
+        self.assertIn("完成：采到 1 条，入库新增 1 条、刷新 0 条", text)
+
+
+class TestStatusSelfCheck(unittest.TestCase):
+    """status 得说清匹配度那一列为什么一直是空的：本机自述文件 + 模型端口。
+
+    只探 127.0.0.1 上有没有人听，不发请求体，也不碰任何凭证。
+    """
+
+    def _free_port(self) -> int:
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    def test_open_port_reads_as_listening(self):
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        self.addCleanup(srv.close)
+        port = srv.getsockname()[1]
+        ok, where = cli._llm_listening(f"http://127.0.0.1:{port}/v1")
+        self.assertTrue(ok)
+        self.assertEqual(where, f"127.0.0.1:{port}")
+
+    def test_closed_port_reads_as_not_listening(self):
+        ok, _ = cli._llm_listening(f"http://127.0.0.1:{self._free_port()}/v1")
+        self.assertFalse(ok)
+
+    def _check_text(self, profile: Path, listening_port: int, missing: int) -> str:
+        buf = io.StringIO()
+        with mock.patch.object(cli, "ANALYSIS_PROFILE_PATH", profile), \
+             mock.patch.object(cli, "LLM_BASE_URL",
+                               f"http://127.0.0.1:{listening_port}/v1"), \
+             mock.patch.object(cli.db, "jobs_missing_details",
+                               return_value=[{} for _ in range(missing)]), \
+             mock.patch.object(cli.db, "pending_analysis", return_value=[]), \
+             redirect_stdout(buf):
+            cli._analysis_check()
+        return buf.getvalue()
+
+    def test_both_missing_prerequisites_are_named(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        text = self._check_text(Path(tmp.name) / "profile.txt", self._free_port(), 25)
+        self.assertIn("本机自述文件 没有写", text)
+        self.assertIn("没人听", text)
+        # 25 条待补 / 每天 20 条 → 向上取整 2 天，并把"别等补完"的用法给出来
+        self.assertIn("待补正文 25 条", text)
+        self.assertIn("要 2 天", text)
+        self.assertIn("--ids", text)
+
+    def test_ready_prerequisites_are_not_flagged(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        profile = Path(tmp.name) / "profile.txt"
+        profile.write_text("Python 三年，写过爬虫和接口，期望东莞，月薪下限 8k", encoding="utf-8")
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        self.addCleanup(srv.close)
+        text = self._check_text(profile, srv.getsockname()[1], 5)
+        self.assertIn("本机自述文件 已就绪", text)
+        self.assertIn("有人在听", text)
+        self.assertNotIn("瓶颈", text)
+
+    def test_short_profile_counts_as_empty(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        profile = Path(tmp.name) / "profile.txt"
+        profile.write_text("东莞", encoding="utf-8")
+        text = self._check_text(profile, self._free_port(), 1)
+        self.assertIn("基本是空的", text)
+
+
+class TestDigest(TempDbCase):
+    """`cli.py digest`：影刀/n8n 拿它当邮件正文，所以一行一件事，且不许有需要 parse 的长句。"""
+
+    def _out(self, days=7):
+        from types import SimpleNamespace
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cli.cmd_digest(SimpleNamespace(days=days))
+        return buf.getvalue()
+
+    def _backdate(self, pjid, day):
+        """把某条的首采时刻挪到历史上：`fetched_at` 由 save_jobs 统一赋值，只能改库。"""
+        import sqlite3
+        conn = sqlite3.connect(db.DB_PATH)
+        try:
+            conn.execute("UPDATE jobs SET fetched_at=? WHERE platform_job_id=?",
+                         (f"{day} 09:00:00", pjid))
+            conn.commit()
+        finally:
+            conn.close()   # Windows 上不关掉临时目录删不掉
+
+    def test_repeat_collect_counts_as_one_new(self):
+        db.save_jobs([make_record(platform="zhitong", platform_job_id="j1")])
+        db.save_jobs([make_record(platform="zhitong", platform_job_id="j1",
+                                  salary_raw="18-25K")])
+        text = self._out()
+        self.assertIn("库里共 1 条", text)
+        self.assertIn("今日新增 1 条", text)
+
+    def test_empty_days_are_still_listed(self):
+        from datetime import datetime, timedelta
+        db.save_jobs([make_record(platform="zhitong", platform_job_id="j1")])
+        self._backdate("j1", (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d"))
+        text = self._out(days=3)
+        self.assertIn("今日新增 0 条", text)
+        for i in (0, 1, 2):
+            self.assertIn((datetime.now() - timedelta(days=i)).strftime("%m-%d"), text)
+        # 今天一条没新增就别硬凑一行"今日分平台"
+        self.assertNotIn("今日分平台", text)
+
+    def test_today_split_is_ordered_by_count(self):
+        db.save_jobs([make_record(platform="zhitong", platform_job_id="a"),
+                      make_record(platform="zhitong", platform_job_id="b"),
+                      make_record(platform="boss", platform_job_id="c")])
+        self.assertIn("今日分平台：智通直聘 2 / Boss直聘 1", self._out())
+
+    def test_days_capped_at_thirty(self):
+        db.save_jobs([make_record(platform="zhitong", platform_job_id="j1")])
+        self.assertIn("近 30 天新增", self._out(days=999))
+
+    def test_no_scores_says_so_instead_of_inventing_a_row(self):
+        db.save_jobs([make_record(platform="zhitong", platform_job_id="j1")])
+        text = self._out()
+        self.assertIn("匹配度：还没跑过分析", text)
+        self.assertNotIn("已分析", text)
+        self.assertFalse([ln for ln in text.splitlines() if ln.startswith("  ")])
+
+    def test_top_three_in_desc_order_and_unscored_stays_out(self):
+        for pid, score in (("j1", 61), ("j2", 88), ("j3", 73.5), ("j4", 40)):
+            db.save_jobs([make_record(platform="zhitong", platform_job_id=pid,
+                                      title=f"职位{pid}", company=f"公司{pid}")])
+            db.save_analysis({"platform": "zhitong", "platform_job_id": pid, "score": score})
+        db.save_jobs([make_record(platform="zhitong", platform_job_id="j9",
+                                  title="没分析过的", company="公司j9")])
+        text = self._out()
+        self.assertIn("已分析 4 条，最高 3 条", text)
+        picked = [ln for ln in text.splitlines() if ln.startswith("  ")]
+        self.assertEqual(len(picked), 3)
+        self.assertTrue(picked[0].startswith("  88分 职位j2 · 公司j2"), picked[0])
+        self.assertIn("73.5分", picked[1])       # 一位小数别丢
+        self.assertIn("61分", picked[2])         # 88.0 那种要写成 88，不拖 .0
+        self.assertNotIn("职位j4", text)
+        self.assertNotIn("没分析过的", text)
+
+    def test_empty_db_tells_you_what_to_run(self):
+        text = self._out()
+        self.assertIn("库里 0 条", text)
+        self.assertIn("cli.py collect", text)
+
+    def test_old_db_without_the_extra_tables_still_prints(self):
+        """老库没建 job_details/job_analysis：digest 得自己补上，不能拿 OperationalError 当摘要。"""
+        import sqlite3
+        db.save_jobs([make_record(platform="zhitong", platform_job_id="j1")])
+        conn = sqlite3.connect(db.DB_PATH)
+        try:
+            conn.execute("DROP TABLE job_details")
+            conn.execute("DROP TABLE job_analysis")
+            conn.commit()
+        finally:
+            conn.close()
+        text = self._out()
+        self.assertIn("库里共 1 条", text)
+        self.assertIn("待补正文 1 条", text)
+        self.assertIn("匹配度：还没跑过分析", text)
+
+
+def zt_item(jid="12406875", poskey="TdFLo0K2", extra_tags=(), **over):
     """按智通真实结构造一条职位：<li data-*...> + 内部展示元素。"""
     attrs = {
         "id": jid, "positionkey": poskey, "urlcityen": "dongguan", "cityname": "东莞",
@@ -509,7 +1106,8 @@ def zt_item(jid="12406875", poskey="TdFLo0K2", **over):
             '<div class="info-tags flex_Ac">'
             '<div class="tag-list-item">' + (attrs["cityname"] + "-长安镇") + "</div>"
             '<div class="tag-list-item">' + attrs["reqdegreestr"] + "</div>"
-            '</div>'
+            + "".join(f'<div class="tag-list-item">{t}</div>' for t in extra_tags)
+            + '</div>'
             '<p class="pos-welfare" title="五险,包吃,包住">五险、包吃、包住</p>'
             "</div></li>")
 
@@ -543,6 +1141,18 @@ class TestZhitongParse(unittest.TestCase):
         r = self.mod.parse_page(zt_page(zt_item(townname="松山湖")))[0]
         self.assertEqual(r["district"], "松山湖")
 
+    def test_company_scale_comes_from_the_tags(self):
+        """规模/性质跟镇区挤在同一串标签里，以前 company_scale 一直写死空串。"""
+        for tag in ("1-100人", "200-500人", "2000以上人", "1000人以上"):
+            r = self.mod.parse_page(
+                zt_page(zt_item(extra_tags=[tag, "民营", "仪器仪表"])))[0]
+            self.assertEqual(r["company_scale"], tag)
+
+    def test_other_tags_are_not_mistaken_for_the_size(self):
+        r = self.mod.parse_page(zt_page(zt_item(extra_tags=["民营", "仪器仪表"])))[0]
+        self.assertEqual(r["company_scale"], "")
+        self.assertEqual(r["district"], "长安镇")
+
     def test_negotiable_salary_has_no_numbers(self):
         body = zt_page(zt_item(shown_salary="面议", minsalary="", maxsalary=""))
         r = self.mod.parse_page(body)[0]
@@ -559,9 +1169,10 @@ class TestZhitongParse(unittest.TestCase):
         self.assertEqual(self.mod.parse_page(zt_page(zt_item(posname=""))), [])
 
     def test_collect_stops_when_page_adds_nothing(self):
-        pages = [zt_page(zt_item(jid="1"), zt_item(jid="2", poskey="B")),
-                 zt_page(zt_item(jid="3", poskey="C")),
-                 zt_page(zt_item(jid="3", poskey="C"))]
+        pages = [zt_page(zt_item(jid="1", posname="IT工程师"),
+                         zt_item(jid="2", poskey="B", posname="IT运维")),
+                 zt_page(zt_item(jid="3", poskey="C", posname="IT专员")),
+                 zt_page(zt_item(jid="3", poskey="C", posname="IT专员"))]
         with mock.patch.object(self.mod, "_fetch", side_effect=pages) as fetch, \
              mock.patch.object(self.mod, "check_daily_cap", return_value=200), \
              mock.patch.object(self.mod, "polite_sleep"):
@@ -569,9 +1180,98 @@ class TestZhitongParse(unittest.TestCase):
         self.assertEqual(len(recs), 3)
         self.assertEqual(fetch.call_count, 3)
 
+    def test_whole_page_blocked_by_gate_keeps_paging(self):
+        """整页都被相关性闸门拦下 != 翻到头：否则下一页真正对口的岗位就永远拿不到。"""
+        pages = [zt_page(zt_item(jid="1", posname="修模师傅"),
+                         zt_item(jid="2", poskey="B", posname="装卸搬运工")),
+                 zt_page(zt_item(jid="3", poskey="C", posname="IT系统工程师"),
+                         zt_item(jid="4", poskey="D", posname="IT运维")),
+                 zt_page(zt_item(jid="3", poskey="C", posname="IT系统工程师"),
+                         zt_item(jid="4", poskey="D", posname="IT运维"))]
+        with mock.patch.object(self.mod, "_fetch", side_effect=pages) as fetch, \
+             mock.patch.object(self.mod, "check_daily_cap", return_value=200), \
+             mock.patch.object(self.mod, "polite_sleep"):
+            recs = self.mod.collect("IT", "东莞", max_pages=5)
+        self.assertEqual([r["title"] for r in recs], ["IT系统工程师", "IT运维"])
+        self.assertEqual(fetch.call_count, 3)      # 第 3 页才是真的翻到头
+
+    def test_pinned_ads_never_reach_the_database(self):
+        """实测智通把焊工/CNC编程这类推广位置在列表最前，data-top="true" 是唯一判据。"""
+        body = zt_page(zt_item(jid="1", posname="焊工", top="true"),
+                       zt_item(jid="2", poskey="B", posname="IT工程师", top="false"),
+                       zt_item(jid="3", poskey="C", posname="IT专员"))
+        recs = self.mod.parse_page(body)
+        self.assertEqual([r["title"] for r in recs], ["IT工程师", "IT专员"])
+
+    def _collect_once(self, body):
+        buf = io.StringIO()
+        with mock.patch.object(self.mod, "_fetch", return_value=body), \
+             mock.patch.object(self.mod, "check_daily_cap", return_value=200), \
+             mock.patch.object(self.mod, "polite_sleep"), \
+             redirect_stdout(buf):
+            recs = self.mod.collect("IT", "东莞", max_pages=3)
+        return recs, buf.getvalue()
+
+    def test_zero_rows_with_cards_on_page_is_reported_as_structure_change(self):
+        """<li class="pos-item"> 还在但 data-* 没了 = 平台改版。说成"风控或无结果"
+        会让人去重扫码、隔天再试，而真正要改的是选择器。"""
+        body = ('<html><ul><li class="position pos-item PosName">'
+                '<div class="salary">10-11K</div></li></ul></html>')
+        recs, out = self._collect_once(body)
+        self.assertEqual(recs, [])
+        self.assertIn("结构变了", out)
+        self.assertIn("1 个职位条目", out)
+        self.assertIn("不是没结果也不是风控", out)
+
+    def test_empty_page_says_no_items_not_structure(self):
+        recs, out = self._collect_once(zt_page())
+        self.assertEqual(recs, [])
+        self.assertIn("没有职位条目", out)
+        self.assertNotIn("结构变了", out)
+
+    def test_all_pinned_page_is_called_pinned(self):
+        """整页都是置顶推广位时不该喊"结构变了"——解析器工作正常，只是没结果。"""
+        body = zt_page(zt_item(jid="1", top="true"), zt_item(jid="2", poskey="B", top="true"))
+        recs, out = self._collect_once(body)
+        self.assertEqual(recs, [])
+        self.assertIn("置顶推广位", out)
+        self.assertNotIn("结构变了", out)
+
+    def test_a_fully_gated_page_stops_repeating_itself(self):
+        """整页被闸门拦下时不该继续翻：这些编号已经"见过"了，翻下去只会拿到同一批。
+
+        以前只按"有没有进库的新 id"判断，于是一个城市全不符的关键词能把 20 页翻满，
+        一页不入库还一直请求平台。
+        """
+        body = zt_page(zt_item(jid="1", cityname="惠州"),
+                       zt_item(jid="2", poskey="B", cityname="惠州"))
+        fetch = mock.Mock(return_value=body)
+        with mock.patch.object(self.mod, "_fetch", fetch), \
+             mock.patch.object(self.mod, "check_daily_cap", return_value=200), \
+             mock.patch.object(self.mod, "polite_sleep"), \
+             redirect_stdout(io.StringIO()):
+            recs = self.mod.collect("IT", "东莞", max_pages=6)
+        self.assertEqual(recs, [])
+        self.assertEqual(fetch.call_count, 2)     # 第 2 页还是那批编号，停
+
+    def test_on_page_saves_every_page_separately(self):
+        seen_batches = []
+        fetch = mock.Mock(side_effect=[
+            zt_page(zt_item(jid="1", posname="IT工程师")),
+            zt_page(zt_item(jid="2", poskey="B", posname="IT运维"))])
+        with mock.patch.object(self.mod, "_fetch", fetch), \
+             mock.patch.object(self.mod, "check_daily_cap", return_value=200), \
+             mock.patch.object(self.mod, "polite_sleep"), \
+             redirect_stdout(io.StringIO()):
+            recs = self.mod.collect("IT", "东莞", max_pages=2,
+                                    on_page=seen_batches.append)
+        self.assertEqual([len(b) for b in seen_batches], [1, 1])
+        self.assertEqual(len(recs), 2)
+
     def test_fetch_error_keeps_what_was_collected(self):
         with mock.patch.object(self.mod, "_fetch",
-                              side_effect=[zt_page(zt_item(jid="1")), OSError("连接重置")]), \
+                              side_effect=[zt_page(zt_item(jid="1", posname="IT工程师")),
+                                           OSError("连接重置")]), \
              mock.patch.object(self.mod, "check_daily_cap", return_value=200), \
              mock.patch.object(self.mod, "polite_sleep"):
             recs = self.mod.collect("IT", "东莞", max_pages=5)
@@ -581,6 +1281,368 @@ class TestZhitongParse(unittest.TestCase):
         self.assertIn("pn=2", self.mod._search_url("IT", "东莞", 2))
         self.assertNotIn("pn=1", self.mod._search_url("IT", "东莞", 1))
         self.assertNotIn("city=", self.mod._search_url("IT", "全国", 1))
+
+
+class TestCollectAndSave(TempDbCase):
+    """collect_and_save：支持每页一存的通道边采边存，不支持的照旧整轮存一次。"""
+
+    def _pages_mod(self, batches, boom_at=None, drops=None):
+        """像智通/前程无忧那样：采集器里自己过闸门，每页把累计的被拦明细交回来。"""
+        mod = mock.Mock()
+        mod.PER_PAGE_SAVE = True
+        mod.SELF_GATES = True          # 前程无忧/智通那样，采集器里已经判过
+
+        def collect(query, city, max_pages, on_page, on_drop=None):
+            handed: dict[str, list[str]] = {}
+            for i, batch in enumerate(batches):
+                on_page(batch)
+                for title in (drops or {}).get(i, []):
+                    handed.setdefault("平台职类不是这个方向", []).append(title)
+                if on_drop:
+                    on_drop(handed)   # 交的是全量累计，交两次也不该翻倍
+                if boom_at is not None and i >= boom_at:
+                    raise RuntimeError("下一页崩了")
+            return [r for b in batches for r in b]
+
+        mod.collect.side_effect = collect
+        return mod
+
+    def _whole_run_mod(self, records):
+        mod = mock.Mock()
+        mod.PER_PAGE_SAVE = False                 # Boss 那条通道的样子
+        mod.SELF_GATES = False                    # 而且它自己不过闸门
+
+        def collect(query, city, max_pages):
+            return records
+
+        mod.collect.side_effect = collect
+        return mod
+
+    def test_every_page_lands_in_the_database(self):
+        mod = self._pages_mod([[make_record(platform_job_id="j1")],
+                               [make_record(platform_job_id="j2")]])
+        records, st = collectors.collect_and_save(mod, "IT", "东莞", 2)
+        self.assertEqual(len(records), 2)
+        self.assertEqual(st["added"], 2)
+        self.assertEqual(len(db.fetch_all()), 2)
+
+    def test_a_crash_keeps_the_pages_already_done(self):
+        """这条就是"每页一存"存在的理由：第 2 页之后崩了，第 1、2 页不该白采。"""
+        mod = self._pages_mod([[make_record(platform_job_id="j1")],
+                               [make_record(platform_job_id="j2")],
+                               [make_record(platform_job_id="j3")]], boom_at=1)
+        with self.assertRaises(RuntimeError):
+            collectors.collect_and_save(mod, "IT", "东莞", 3)
+        self.assertEqual(sorted(r["platform_job_id"] for r in db.fetch_all()),
+                         ["j1", "j2"])
+
+    def test_channel_without_page_saving_is_still_saved(self):
+        mod = self._whole_run_mod([make_record(platform_job_id="j1")])
+        records, st = collectors.collect_and_save(mod, "Python开发", "深圳", 1)
+        self.assertEqual(st["added"], 1)
+        self.assertEqual(len(db.fetch_all()), 1)
+
+    def test_repeated_job_across_pages_counts_as_refresh(self):
+        mod = self._pages_mod([[make_record(platform_job_id="j1")],
+                               [make_record(platform_job_id="j1", salary_raw="30-40K")]])
+        _, st = collectors.collect_and_save(mod, "IT", "东莞", 2)
+        self.assertEqual((st["added"], st["refreshed"]), (1, 1))
+        self.assertEqual(len(db.fetch_all()), 1)
+
+    def test_channel_without_gate_is_filtered_before_writing(self):
+        """Boss 那条通道唯一没自己过闸门的：落库前得把不对的挡在库外。"""
+        bad_city = make_record(platform_job_id="j2", city="惠州")
+        substring = make_record(platform_job_id="j3", title="TITOK运营专员", city="东莞")
+        good = make_record(platform_job_id="j4", title="IT运维工程师", city="东莞")
+        mod = self._whole_run_mod([good, bad_city, substring])
+        records, st = collectors.collect_and_save(mod, "IT", "东莞", 1)
+        self.assertEqual(len(records), 3, "采到的原始条数不该被闸门改写")
+        self.assertEqual(st["dropped"], 2)
+        self.assertEqual(st["added"], 1)
+        self.assertEqual([r["platform_job_id"] for r in db.fetch_all()], ["j4"])
+
+    def test_channel_that_self_gates_is_not_judged_twice(self):
+        """自己声明 SELF_GATES 的通道，公共落库口不能再判一遍——
+        否则同一批记录被两套口径过滤，页面上剔掉的条数会对不上采集器打印的。"""
+        mod = self._pages_mod([[make_record(platform_job_id="j1", city="惠州")]])
+        _, st = collectors.collect_and_save(mod, "IT", "东莞", 1)
+        self.assertEqual(st["dropped"], 0)
+        self.assertEqual(st["added"], 1)
+
+    def test_wildcard_city_probe_is_not_filtered(self):
+        """传了「全国」就是想看全部，闸门不该按城市拦（关键词规则照旧生效）。"""
+        mod = self._whole_run_mod([make_record(platform_job_id="j1", city="贺州",
+                                               title="IT支持")])
+        _, st = collectors.collect_and_save(mod, "IT", "全国", 1)
+        self.assertEqual((st["dropped"], st["added"]), (0, 1))
+
+    def test_central_gate_leaves_the_blocked_titles_in_the_log(self):
+        """被拦的标题得跟原因一起留痕：闸门在入库之前判，库里没这些行，
+        光有个数字没法复核是不是误杀。"""
+        mod = self._whole_run_mod([
+            make_record(platform_job_id="j1", city="东莞", title="IT运维工程师"),
+            make_record(platform_job_id="j2", city="东莞", title="锅炉操作工")])
+        collectors.collect_and_save(mod, "IT运维", "东莞", 1)
+        r = db.recent_collect_runs()[0]
+        self.assertEqual(r["drop_reasons"], {"标题像一线操作岗": 1})
+        self.assertEqual(r["drop_titles"], {"标题像一线操作岗": ["锅炉操作工"]})
+
+    def test_self_gated_channel_hands_its_detail_to_the_log(self):
+        """自判通道不经过公共落库口，明细只能由 on_drop 交回来；
+        每页交的是全量累计，并两次不能把条数翻倍。"""
+        mod = self._pages_mod([[make_record(platform_job_id="j1")],
+                               [make_record(platform_job_id="j2")]],
+                              drops={0: ["污水处理操作员"], 1: ["光伏运维1"]})
+        _, st = collectors.collect_and_save(mod, "IT运维", "东莞", 2)
+        r = db.recent_collect_runs()[0]
+        self.assertEqual(r["drop_titles"],
+                         {"平台职类不是这个方向": ["污水处理操作员", "光伏运维1"]})
+        self.assertEqual(r["drop_reasons"], {"平台职类不是这个方向": 2})
+        # 回执里的条数也得以明细为准，否则页面上"闸门剔掉 0 条"会跟采集器打印的对不上
+        self.assertEqual(st["dropped"], 2)
+
+    def test_run_is_recorded_with_query_and_drop_reasons(self):
+        """命令行那条路径没有页面任务日志，事后全靠 collect_runs 这一行复盘。"""
+        mod = self._whole_run_mod([
+            make_record(platform_job_id="j1", city="东莞", title="IT运维工程师"),
+            make_record(platform_job_id="j2", city="惠州", title="IT运维工程师")])
+        collectors.collect_and_save(mod, "IT", "东莞", 2)
+        rows = db.recent_collect_runs()
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual((r["query"], r["city"], r["pages"]), ("IT", "东莞", 2))
+        self.assertEqual((r["collected"], r["added"], r["dropped"]), (2, 1, 1))
+        self.assertEqual(r["drop_reasons"], {"城市不符": 1})
+        self.assertIsNone(r["error"])
+
+    def test_failed_run_still_leaves_a_record(self):
+        """崩了也要留痕：那 5 页翻到一半失败，至少得查得到当时搜的是什么词。"""
+        mod = mock.Mock()
+        mod.PER_PAGE_SAVE = False
+        mod.SELF_GATES = False
+        mod.collect.side_effect = RuntimeError("登录态失效")
+        with self.assertRaises(RuntimeError):
+            collectors.collect_and_save(mod, "IT", "东莞", 1)
+        r = db.recent_collect_runs()[0]
+        self.assertEqual(r["error"], "登录态失效")
+        self.assertEqual(r["collected"], 0)
+
+
+class TestBlockRules(TempDbCase):
+    """屏蔽规则：一条规则挡掉一整类，省得「仓库管理员」换家公司再出现一次。"""
+
+    def test_keyword_rule_stops_the_row_before_it_lands(self):
+        db.add_block_rule("keyword", "仓库")
+        st = db.save_stats([make_record(platform_job_id="j1", title="仓库管理员"),
+                            make_record(platform_job_id="j2", title="IT运维工程师")])
+        self.assertEqual((st["added"], st["rules"]), (1, 1))
+        self.assertEqual([r["platform_job_id"] for r in db.fetch_all()], ["j2"])
+
+    def test_keyword_match_ignores_case(self):
+        db.add_block_rule("keyword", "python")
+        st = db.save_stats([make_record(platform_job_id="j1", title="Python开发工程师")])
+        self.assertEqual((st["added"], st["rules"]), (0, 1))
+
+    def test_company_rule_is_exact_match_not_substring(self):
+        """公司名整串相等才拦：「某某科技」不该顺手把「某某科技有限公司」也挡掉，
+        那是两家公司，误杀了就成了永久盲区。"""
+        db.add_block_rule("company", "某某科技")
+        st = db.save_stats([make_record(platform_job_id="j1", company="某某科技"),
+                            make_record(platform_job_id="j2", company="某某科技有限公司")])
+        self.assertEqual((st["added"], st["rules"]), (1, 1))
+        self.assertEqual([r["platform_job_id"] for r in db.fetch_all()], ["j2"])
+
+    def test_dropping_a_rule_lets_rows_in_again(self):
+        db.add_block_rule("keyword", "维修")
+        self.assertEqual(db.save_stats([make_record(title="打印机维修")])["added"], 0)
+        self.assertTrue(db.remove_block_rule("keyword", "维修"))
+        self.assertEqual(db.save_stats([make_record(title="打印机维修")])["added"], 1)
+
+    def test_rule_beats_refresh_of_an_existing_row(self):
+        """已经在库里的职位，加了规则之后再采一次不该把它刷新一遍——拦下来就是不碰。"""
+        rec = make_record(platform_job_id="j1", title="仓库管理员")
+        db.save_stats([rec])
+        db.add_block_rule("keyword", "仓库")
+        st = db.save_stats([dict(rec, salary_raw="30-40K")])
+        self.assertEqual((st["added"], st["refreshed"], st["rules"]), (0, 0, 1))
+
+    def test_adding_the_same_rule_twice_is_not_an_error(self):
+        self.assertTrue(db.add_block_rule("keyword", "仓库"))
+        self.assertFalse(db.add_block_rule("keyword", "仓库"))
+        self.assertEqual(len(db.block_rule_list()), 1)
+
+    def test_bad_kind_or_empty_value_is_rejected(self):
+        with self.assertRaises(ValueError):
+            db.add_block_rule("title", "仓库")
+        with self.assertRaises(ValueError):
+            db.add_block_rule("keyword", "   ")
+
+    def test_cli_adds_lists_and_drops_rules(self):
+        from types import SimpleNamespace
+        buf = io.StringIO()
+        args = SimpleNamespace(company="某某科技", keyword="仓库 普工", drop=None, clear=None)
+        with redirect_stdout(buf):
+            cli.cmd_blocked(args)
+        self.assertIn("已加上屏蔽规则：公司「某某科技」", buf.getvalue())
+        self.assertIn("关键词「普工」", buf.getvalue())
+
+        buf2 = io.StringIO()
+        with redirect_stdout(buf2):
+            cli.cmd_blocked(SimpleNamespace(company=None, keyword=None,
+                                           drop="关键词:仓库", clear=None))
+        out = buf2.getvalue()
+        self.assertIn("已放掉规则：关键词「仓库」", out)
+        # 加了 1 条公司 + 2 个关键词，放掉「仓库」后还剩 2 条
+        self.assertIn("剩下的规则：2 条", out)
+
+        buf3 = io.StringIO()
+        with redirect_stdout(buf3):
+            cli.cmd_blocked(SimpleNamespace(company=None, keyword=None,
+                                           drop="仓库", clear=None))
+        self.assertIn("格式得是", buf3.getvalue())
+
+
+class TestRelevanceGate(unittest.TestCase):
+    """相关性闸门：用例照着两批真实返回写——2026-10-12 的 IT@东莞，
+    2026-10-17 的 IT运维@东莞（智通 41 条，其中 11 条是锅炉操作工这类跨行岗位）。"""
+
+    def rec(self, title, city="东莞", skills=None, industry="", platform="zhitong"):
+        return {"platform": platform, "platform_job_id": "x", "title": title,
+                "city": city, "skills": skills or [], "industry": industry}
+
+    def test_short_keyword_must_stand_alone(self):
+        keep = ["IT工程师（SRM经验）", "IT运维工程师", "硬件IT储干（非东莞上班）",
+                "副总经理助理（ai/IT方向）", "IT 应用系统工程师"]
+        drop = ["TITOK运营", "FIT模师傅", "外贸开发专员（furniture）", "洗水杂工", "叉车司机"]
+        for t in keep:
+            self.assertTrue(relevance.keyword_ok(self.rec(t), "IT"), t)
+        for t in drop:
+            self.assertFalse(relevance.keyword_ok(self.rec(t), "IT"), t)
+
+    def test_keyword_can_come_from_skill_tags_and_tags_are_more_forgiving(self):
+        # 标题按词边界，技能标签按子串：ITIL 是真相关的运维缩写，不该被误杀
+        self.assertTrue(relevance.keyword_ok(self.rec("运维工程师", skills=["IT运维"]), "IT"))
+        self.assertTrue(relevance.keyword_ok(self.rec("运维工程师", skills=["ITIL"]), "IT"))
+        self.assertFalse(relevance.keyword_ok(self.rec("运维工程师", skills=["仓储"]), "IT"))
+
+    def test_long_keywords_are_left_to_the_platform(self):
+        # python / 软件开发 这类长词不做字面判断：标题没写语言的岗位也可能是对的
+        for q in ("python", "Java", "软件开发", "数据分析", "web前端"):
+            self.assertTrue(relevance.keyword_ok(self.rec("后端开发工程师"), q), q)
+
+    def test_mixed_keyword_hits_by_chinese_two_gram(self):
+        """'IT运维' 这种中英混写的关键词：字母部分按词边界、中文部分按二字组算命中。"""
+        for t in ("IT运维工程师", "IT硬件运维", "运维工程师", "桌面运维技术员", "服务器运维"):
+            self.assertTrue(relevance.query_hits(self.rec(t), "IT运维"), t)
+        for t in ("锅炉操作工", "物业项目负责人", "技术员助理"):
+            self.assertFalse(relevance.query_hits(self.rec(t), "IT运维"), t)
+        # 二字组是为了不误杀：查询写"软件开发"，标题写"后端开发工程师"也算命中
+        self.assertTrue(relevance.query_hits(self.rec("后端开发工程师"), "软件开发"))
+        self.assertTrue(relevance.query_hits(self.rec("大数据工程师"), "数据分析"))
+        self.assertTrue(relevance.query_hits(self.rec("运维工程师", skills=["IT"]), "IT运维"))
+
+    def test_family_rule_needs_the_channel_to_opt_in(self):
+        """智通的 industry 是「一级行业-二级职类」，第二段是职能，可以拿来判方向；
+        没声明 FAMILY_GATE 的通道不判——Boss 那个字段装的是公司行业。"""
+        rec = self.rec("技术员助理", industry="生产制造-智能制造")
+        self.assertEqual(relevance.reject_reason(rec, "IT运维", "东莞"), None)
+        self.assertEqual(relevance.reject_reason(rec, "IT运维", "东莞", family=True),
+                         "平台职类不是这个方向")
+
+    def test_family_rule_passes_it_roles_whose_title_lacks_the_keyword(self):
+        """标题不带 IT/运维、但平台标的职类是技术方向的，得放行：
+        2026-10-17 那页实测有 程序员、资讯主管、ERP实施工程师、系统架构师。"""
+        for title, industry in (("程序员", "AI/互联网-运维/技术支持"),
+                                ("资讯主管", "AI/互联网-技术项目管理"),
+                                ("ERP实施工程师", "AI/互联网-技术项目管理"),
+                                ("IT主管", "电子/电气/通信-通信"),
+                                ("电工/IT", "生产制造-技工"),
+                                ("IT兼ERP专员", "管培生/非企业从业者-社工/兼职")):
+            rec = self.rec(title, industry=industry)
+            self.assertIsNone(relevance.reject_reason(rec, "IT运维", "东莞", family=True),
+                              f"{title} / {industry}")
+
+    def test_company_industry_alone_is_never_a_family(self):
+        """Boss 写的是公司行业（没有"一级-二级"那个连字符），拿它判方向会误杀：
+        10-13 实测"园区弱电IT运维工程师"标的是环保。"""
+        for title in ("园区弱电IT运维工程师", "IT运维工程师"):
+            rec = self.rec(title, industry="环保", platform="boss")
+            self.assertEqual(relevance.job_family(rec), "")
+            self.assertIsNone(relevance.reject_reason(rec, "IT运维", "东莞", family=True))
+
+    def test_cross_field_ops_titles_are_cut_even_when_the_keyword_hits(self):
+        """光伏运维、污水运维：字面命中"运维"，但一眼不是 IT。实测拦得住。"""
+        for title, industry in (("光伏运维1", "管培生/非企业从业者-社工/兼职"),
+                                ("污水处理操作员", "能源/环保/农业-环保"),
+                                ("空调维修工", "生产制造-技工"),
+                                ("锅炉操作工", "生产制造-技工")):
+            rec = self.rec(title, industry=industry)
+            self.assertEqual(relevance.reject_reason(rec, "IT运维", "东莞", family=True),
+                             "标题像一线操作岗", title)
+
+    def test_a_marketing_title_is_cut_by_the_family_rule_not_the_word_list(self):
+        """TITOK运营 那种是"方向不对"，不是"蓝岗"：原因得说准，不然复核时会去找词表。"""
+        rec = self.rec("TITOK运营", industry="客服/运营-内容运营")
+        self.assertEqual(relevance.reject_reason(rec, "IT运维", "东莞", family=True),
+                         "平台职类不是这个方向")
+
+    def test_one_welfare_word_in_the_title_is_not_evidence_enough(self):
+        """厂里 IT 也包吃住、也兼司机——单个说法不拦；两个一起出现才拦。
+        这四条标题全是库里真实采到的。"""
+        keep = ("IT工程师（包吃住）", "IT技术支持兼行政司机",
+                "IT专员/IT主管（包吃住+双休+五险一金）")
+        for title in keep:
+            rec = self.rec(title, industry="AI/互联网-运维/技术支持", platform="boss")
+            self.assertFalse(relevance.blue_hit(rec, "IT运维"), title)
+        rec = self.rec("7000-9000技术员包吃住 五险一金长白班运维", platform="boss")
+        self.assertTrue(relevance.blue_hit(rec, "IT运维"))
+
+    def test_blocked_titles_are_listed_for_review(self):
+        dropped = {"平台职类不是这个方向": ["技术员助理", "体系工程师"],
+                   "标题像一线操作岗": ["锅炉操作工"]}
+        self.assertEqual(relevance.count(dropped), 3)
+        self.assertEqual(relevance.summarize(dropped),
+                         "平台职类不是这个方向 2 条、标题像一线操作岗 1 条")
+        self.assertIn("技术员助理（平台职类不是这个方向）", relevance.titles(dropped))
+        self.assertIn("…共 3 条", relevance.titles(dropped, limit=2))
+        acc: dict[str, list[str]] = {}
+        relevance.merge(dropped, acc)      # 逐页并：每页交的是本页新增的
+        relevance.merge({"城市不符": ["IT主管"]}, acc)
+        self.assertEqual(relevance.count(acc), 4)
+        self.assertEqual(acc["平台职类不是这个方向"], ["技术员助理", "体系工程师"])
+
+    def test_city_rule_follows_the_command_not_the_platform(self):
+        self.assertEqual(relevance.reject_reason(self.rec("IT工程师", city="惠州"),
+                                                 "IT", "东莞"), "城市不符")
+        self.assertEqual(relevance.reject_reason(self.rec("IT工程师", city="贺州"),
+                                                 "IT", "东莞市"), "城市不符")
+        self.assertIsNone(relevance.reject_reason(self.rec("IT工程师", city="东莞市"),
+                                                  "IT", "东莞"))
+        # 全国/不传城市 = 不按城市拦
+        self.assertIsNone(relevance.reject_reason(self.rec("IT工程师", city="贺州"),
+                                                  "IT", "全国"))
+        self.assertIsNone(relevance.reject_reason(self.rec("IT工程师", city=""),
+                                                  "IT", "东莞"))
+
+    def test_gate_counts_reasons(self):
+        recs = [self.rec("IT工程师"), self.rec("TITOK运营"),
+                self.rec("IT主管", city="惠州"), self.rec("洗水杂工")]
+        kept, dropped = relevance.gate(recs, "IT", "东莞")
+        self.assertEqual([r["title"] for r in kept], ["IT工程师"])
+        self.assertEqual(dropped, {"标题没写这个关键词": ["TITOK运营", "洗水杂工"],
+                                   "城市不符": ["IT主管"]})
+        self.assertEqual(relevance.count(dropped), 3)
+        self.assertIn("城市不符 1 条", relevance.summarize(dropped))
+
+    def test_relaxed_query_unlocks_the_city_rule_only(self):
+        """不传关键词/传全国 = 只想放宽城市，蓝岗那条词表判的是岗位本身，照样拦。"""
+        kept, dropped = relevance.gate([self.rec("网络管理员", city="全国"),
+                                        self.rec("IT工程师")], "", "")
+        self.assertEqual(len(kept), 2)
+        self.assertEqual(dropped, {})
+        kept2, dropped2 = relevance.gate([self.rec("洗水杂工")], "", "")
+        self.assertEqual(kept2, [])
+        self.assertEqual(dropped2, {"标题像一线操作岗": ["洗水杂工"]})
 
 
 ZT_DETAIL_HTML = """
@@ -686,6 +1748,15 @@ class TestDetailStore(TempDbCase):
         self.assertEqual(db.detail_keys(), ["zhitong:j1"])
         self.assertEqual(db.count_details_today(), 1)
 
+    def test_missing_listing_can_drop_channels_without_details(self):
+        """前程无忧的行有详情页链接却永远补不上正文：留在候选里就是虚高的待补数。"""
+        self.make_job("j1")
+        self.make_job("g1", platform="job51")
+        self.assertEqual(len(db.jobs_missing_details()), 2)
+        self.assertEqual(
+            [j["platform_job_id"] for j in
+             db.jobs_missing_details(exclude_platforms=("job51",))], ["j1"])
+
     def test_export_csv_carries_description(self):
         self.make_job()
         db.save_details([{"platform": "zhitong", "platform_job_id": "j1",
@@ -769,10 +1840,39 @@ class TestCollectDetails(TempDbCase):
             details.collect_details([det_job("j1"), det_job("j2")], limit=1)
         self.assertEqual(calls, ["j1"])
 
-    def test_job51_detail_is_never_fetched(self):
-        """前程无忧详情页要滑块验证：按红线一个请求都不发。"""
-        from jobstats.collectors import job51
-        self.assertIsNone(job51.fetch_detail(det_job()))
+    def test_no_detail_channel_never_touches_the_platform(self):
+        """前程无忧详情页要滑块验证：按红线不绕，所以这一层连 fetcher 都不给它配。"""
+        self.assertNotIn("job51", details.FETCHERS)
+        self.assertIn("滑块验证", details.NO_DETAIL["job51"])
+
+    def test_every_channel_is_fetchable_or_explained(self):
+        """新增平台时二选一：能抓正文，或把不能的原因写进 NO_DETAIL。
+
+        两边都空着的话，页面只能瞎猜，猜出来的就是"职位可能已下架"这种误导话。
+        """
+        from jobstats.collectors import COLLECTORS
+        for name in COLLECTORS:
+            self.assertTrue(name in details.FETCHERS or name in details.NO_DETAIL, name)
+        self.assertFalse(set(details.FETCHERS) & set(details.NO_DETAIL))
+
+    def test_no_detail_rows_take_neither_the_slot_nor_the_quota(self):
+        """这些行要在挑名额之前就被摘掉：不占 --limit，也不许碰今日正文额度。"""
+        calls = []
+
+        def fake(j):
+            calls.append(j["platform_job_id"])
+            return {"platform": "zhitong", "platform_job_id": j["platform_job_id"],
+                    "description": "d", "keyword_tags": [], "url": "u"}
+
+        jobs = [det_job("g1", "job51"), det_job("g2", "job51"), det_job("j1")]
+        with mock.patch.object(details, "FETCHERS", {"zhitong": fake}), \
+             mock.patch.object(details, "polite_sleep"), \
+             redirect_stdout(io.StringIO()) as buf:
+            res = details.collect_details(jobs, limit=1)
+        self.assertEqual(calls, ["j1"])
+        self.assertEqual(res["unreachable"], 2)
+        self.assertEqual(db.count_details_today(), 1)
+        self.assertIn("滑块验证", buf.getvalue())
 
 
 class TestDetailApiEndpoints(unittest.TestCase):
@@ -791,6 +1891,224 @@ class TestDetailApiEndpoints(unittest.TestCase):
         js = report.DETAIL_JS
         self.assertIn("pre.textContent = d.description", js)
         self.assertNotIn("innerHTML = d.description", js)
+
+    def test_no_detail_map_reaches_the_page_and_leaves_no_placeholder(self):
+        nd = {"job51": "前程无忧这条通道不抓正文"}
+        web = report.render_web([make_record()], "T", "", no_detail=nd)
+        self.assertIn('"job51": "前程无忧这条通道不抓正文"', web)
+        self.assertNotIn("__NO_DETAIL__", web)      # 槽位值里嵌的标记要就地展开
+        self.assertIn("data-nd", report.FILTER_TEMPLATE)   # 按平台改按钮文案
+        static = report._filter_html(report.STATIC_SUB_LINE, [make_record()], web=False)
+        self.assertIn("const NO_DETAIL = {};", static)   # 静态版没正文按钮，也不能引用不到
+        self.assertNotIn("前程无忧这条通道", static)
+        self.assertNotIn("__NO_DETAIL__", static)
+
+
+class TestDetailApiReasons(TempDbCase):
+    """正文接口不许把"这条通道拿不到正文"说成"职位已下架"——职位明明还在。"""
+
+    def test_job51_row_is_answered_with_the_channel_reason(self):
+        db.save_jobs([make_record(platform="job51", platform_job_id="g1")])
+        jid = db.fetch_all()[0]["id"]
+        with mock.patch.object(server.details, "collect_details",
+                               side_effect=AssertionError("不该发请求")):
+            res = post_api("/api/detail", {"id": jid})
+        self.assertEqual(res["status"], 400)
+        self.assertIn("滑块验证", res["obj"]["error"])
+        self.assertNotIn("已下架", res["obj"]["error"])
+
+
+class TestSkillSource(TempDbCase):
+    """技能列的两个来源：列表页标签，和列表页不给这一列的平台从详情页关键词兜过来。
+
+    起因是 238 条智通的 skills 全是空——不是解析失败，是列表页没有这一列
+    （实测：它的标签只有城市-镇区/学历/经验/公司性质/公司规模/行业）。
+    """
+
+    def zt(self, jid="z1", skills_list=()):
+        db.save_jobs([make_record(platform="zhitong", platform_job_id=jid,
+                                  skills=list(skills_list), company_scale="1-100人")])
+
+    def jd(self, jid="z1", tags=("华为", "锐捷", "TCP/IP 协议栈")):
+        db.save_details([{"platform": "zhitong", "platform_job_id": jid,
+                          "description": "负责机房与网络运维", "keyword_tags": list(tags),
+                          "url": "u"}])
+
+    def row(self, jid="z1"):
+        return next(r for r in db.fetch_all() if r["platform_job_id"] == jid)
+
+    def test_detail_tags_fill_the_empty_skill_column(self):
+        self.zt()
+        self.jd()
+        r = self.row()
+        self.assertEqual(r["skills"], ["华为", "锐捷", "TCP/IP 协议栈"])
+        self.assertEqual(r["skill_src"], "jd")
+
+    def test_list_page_tags_win_when_both_exist(self):
+        """列表页给了词就用列表页的：那才是统计口径一直在用的那一列，兜底只补空洞。"""
+        self.zt(skills_list=["linux", "python"])
+        self.jd(tags=("华为",))
+        r = self.row()
+        self.assertEqual(r["skills"], ["Linux", "Python"])
+        self.assertEqual(r["skill_src"], "list")
+
+    def test_nothing_invented_without_a_detail(self):
+        self.zt()
+        r = self.row()
+        self.assertEqual(r["skills"], [])
+        self.assertEqual(r["skill_src"], "")
+
+    def test_welfare_words_in_detail_tags_stay_out_of_skills(self):
+        self.zt()
+        self.jd(tags=("包住", "五险一金", "ERP运维"))
+        self.assertEqual(self.row()["skills"], ["ERP运维"])
+
+    def test_the_analysis_queue_uses_the_same_skills(self):
+        """两个读出口径必须一致。
+
+        分叉过一次：筛选台写着"华为/锐捷/TCP/IP 协议栈"，`pending_analysis` 却把
+        技能洗成空的，送给模型的提示词回一句「技能标签：未列」，
+        模型照着"这条没写技能"打分——智通的行几乎全是这样。
+        """
+        self.zt()
+        self.jd()
+        pend = db.pending_analysis(limit=5)
+        self.assertEqual(len(pend), 1)
+        self.assertEqual(pend[0]["skills"], self.row()["skills"])
+        self.assertEqual(pend[0]["skill_src"], "jd")
+        # 下游（n8n）还要那份原样的关键词表，清洗不能把它吃掉
+        self.assertEqual(pend[0]["keyword_tags"], ["华为", "锐捷", "TCP/IP 协议栈"])
+
+    def test_prompt_stops_saying_skills_absent_when_jd_has_them(self):
+        self.zt()
+        self.jd()
+        block = analyze.job_block(db.pending_analysis(limit=5)[0])
+        self.assertIn("技能标签：华为 / 锐捷 / TCP/IP 协议栈", block)
+        self.assertNotIn("技能标签：未列", block)
+
+    def test_old_db_without_the_details_table_still_reads(self):
+        """老库没建 job_details 表：没得兜就算了，不能整页读不出来。"""
+        import sqlite3
+        self.zt(skills_list=["linux"])
+        conn = sqlite3.connect(db.DB_PATH)
+        try:
+            conn.execute("DROP TABLE job_details")
+            conn.commit()
+        finally:
+            conn.close()
+        r = self.row()
+        self.assertEqual(r["skills"], ["Linux"])
+        self.assertEqual(r["skill_src"], "list")
+
+    def test_declared_platforms_are_real_channels(self):
+        from jobstats.collectors import COLLECTORS
+        for name, why in skills.NO_LIST_SKILLS.items():
+            self.assertIn(name, COLLECTORS)
+            self.assertIn("列表页", why)
+            self.assertIn("详情页", why)
+
+    def test_caption_counts_both_sources(self):
+        self.zt("z1")
+        self.zt("z2", skills_list=["linux"])
+        self.zt("z3")
+        self.jd("z1")
+        cap = report.build_stats(db.fetch_all())["skill_caption"]
+        for needle in ("1 条来自列表页标签", "1 条来自详情页关键词",
+                       "1 条两处都没取到", "没词不等于没要求"):
+            self.assertIn(needle, cap)
+
+    def test_js_strings_never_span_a_line(self):
+        """模板里要写 \\n：只写 \n 会被 Python 先吃掉，JS 里就成了跨行的字符串常量，
+        整段 <script> SyntaxError，页面所有控件一起死掉（这次真踩到了）。"""
+        def odd_quote_lines(src):
+            return [i for i, ln in enumerate(src.splitlines(), 1) if ln.count("'") % 2]
+        for name in ("FILTER_TEMPLATE", "WEB_COLLECT_PANEL", "WEB_COLLECT_SCRIPT",
+                     "DETAIL_JS", "STATUS_JS", "DELETE_JS"):
+            self.assertEqual([], odd_quote_lines(getattr(report, name)), name)
+        # 自检：这个检测得真抓得到那种写法，不然只是个摆设
+        self.assertEqual([1], odd_quote_lines("a = '一\ndef g = 2\n"))
+
+    def test_pages_ship_the_capability_table(self):
+        self.zt()
+        self.jd()
+        records = db.fetch_all()
+        for html in (report.render_web(records, "T", ""),
+                     report._filter_html(report.STATIC_SUB_LINE, records, web=False)):
+            self.assertNotIn("__NO_LIST_SKILLS__", html)
+            self.assertIn("列表页没有技能标签这一列", html)
+        web = report.render_web(records, "T", "")
+        for needle in ("const NO_LIST_SKILLS = ", 'id="skill-note"', "renderSkillNote(",
+                       "来自详情页"):
+            self.assertIn(needle, web)
+
+
+class TestCrossRef(TempDbCase):
+    """跨平台对照只按"归一公司名+归一标题"认，认不出就什么都不标——宁漏不错。"""
+
+    def seed(self, *specs):
+        for platform, pjid, company, title in specs:
+            db.save_jobs([make_record(platform=platform, platform_job_id=pjid,
+                                      company=company, title=title)])
+        rows = db.fetch_all()
+        return crossref.attach(rows)
+
+    def by(self, rows, platform):
+        return next(r for r in rows if r["platform"] == platform)
+
+    def test_normalizers_fold_what_the_platforms_write_differently(self):
+        # 一层层剥到剥不动：一边写全 `…科技有限公司`、一边写 `…科技`，得归到同一个头
+        self.assertEqual(crossref.norm_company("东莞市微科光电科技有限公司"), "东莞市微科光电")
+        self.assertEqual(crossref.norm_company("东莞市微科光电科技"), "东莞市微科光电")
+        self.assertEqual(crossref.norm_title("IT运维工程师（包吃住）"), "it运维工程师")
+        self.assertEqual(crossref.norm_title("it 运维工程师"), "it运维工程师")
+        self.assertEqual(crossref.norm_title("运维工程师/JO0123456"), "运维工程师jo0123456")
+
+    def test_sibling_on_another_platform_is_listed_without_itself(self):
+        rows = self.seed(("job51", "g1", "东莞市微科光电科技有限公司", "IT运维工程师"),
+                         ("zhitong", "z1", "东莞市微科光电科技", "IT运维工程师（包住）"))
+        cross = self.by(rows, "job51")["cross"]
+        self.assertEqual([x["platform"] for x in cross], ["zhitong"])
+        # 面板要点开对面那条的正文，所以行号、平台职位号都得带上
+        self.assertTrue(cross[0]["id"] and cross[0]["platform_job_id"])
+        self.assertEqual(cross[0]["seen"], cross[0]["seen"][:10])
+
+    def test_same_platform_twice_is_not_a_cross_match(self):
+        """两条同公司同岗位都在智通，是同一平台采重了，不是跨平台对照。"""
+        rows = self.seed(("zhitong", "a", "甲公司", "IT运维"),
+                         ("zhitong", "b", "甲公司", "IT运维"))
+        self.assertEqual([r["cross"] for r in rows], [[], []])
+
+    def test_different_title_is_not_merged(self):
+        rows = self.seed(("zhitong", "a", "甲公司", "IT运维"),
+                         ("job51", "b", "甲公司", "行政专员"))
+        self.assertEqual([r["cross"] for r in rows], [[], []])
+
+    def test_missing_company_or_title_stays_out_of_the_index(self):
+        rows = self.seed(("zhitong", "a", "", "IT运维"), ("job51", "b", "", "IT运维"))
+        self.assertEqual([r["cross"] for r in rows], [[], []])
+
+    def test_has_detail_marks_the_sibling_we_can_borrow(self):
+        rows = self.seed(("job51", "g", "甲公司", "IT运维"), ("zhitong", "z", "甲公司", "IT运维"))
+        db.save_details([{"platform": "zhitong", "platform_job_id": "z",
+                          "description": "负责机房", "keyword_tags": [], "url": "u"}])
+        cross = self.by(crossref.attach(db.fetch_all()), "job51")["cross"]
+        self.assertTrue(cross[0]["has_detail"])
+
+    def test_panel_keeps_the_fourteen_column_layout(self):
+        """对照面板占满现有的 14 列，不新增表头——列数一变整张表就错位。"""
+        self.assertIn("cell.colSpan = 14", report.DETAIL_JS)
+        self.assertIn("toggleXref", report.DETAIL_JS)
+        self.assertIn("data-xref", report.FILTER_TEMPLATE)
+        static = report._filter_html(report.STATIC_SUB_LINE, [make_record()], web=False)
+        self.assertNotIn("toggleXref", static)
+        self.assertIn("另见", static)          # 静态页也有标签，只是点不开
+
+    def test_cross_data_rides_in_the_embedded_records(self):
+        rows = self.seed(("job51", "g", "甲公司", "IT运维工程师"),
+                         ("zhitong", "z", "甲公司", "IT运维工程师（包住）"))
+        html = report.render_web(rows, "T", "")
+        self.assertIn('"cross": [{"id":', html)
+        self.assertIn("15-25K", html)
 
 
 class TestApplicationStatus(TempDbCase):
@@ -893,11 +2211,1025 @@ class TestStatusUi(unittest.TestCase):
         self.assertIn(f"const NOTE_MAX = {db.NOTE_MAX};", web)
 
     def test_empty_row_spans_every_column(self):
+        """表头加一列，空表和正文行就得跟着加一列——数字从模板里读，别写死。"""
         web = report.render_web([make_record()], "T", "")
         static = report._filter_html(report.STATIC_SUB_LINE, [], web=False)
-        self.assertIn('colspan="${WEB?11:10}"', web)
-        self.assertIn('colspan="${WEB?11:10}"', static)
-        self.assertIn("cell.colSpan = 11;", report.DETAIL_JS)   # 正文行横跨整行
+        span = re.search(r'colspan="\$\{WEB\?(\d+):(\d+)\}"', report.FILTER_TEMPLATE)
+        self.assertTrue(span, "空表那行必须写清网页版/静态页各跨几列")
+        for html, expect in ((web, int(span.group(1))), (static, int(span.group(2)))):
+            head = re.search(r"<thead><tr>(.*?)</tr></thead>", html, re.S).group(1)
+            self.assertEqual(expect, head.count("<th>"), "跨列数和表头列数对不上")
+        self.assertIn(f"cell.colSpan = {span.group(1)};", report.DETAIL_JS)
+
+
+class TestIndustryFilter(unittest.TestCase):
+    """清噪音岗位靠行业筛：控件、一级归并、未标注桶、撤销和回填都得在两种页里齐活。"""
+
+    def test_both_variants_wire_the_industry_select(self):
+        web = report.render_web([make_record()], "T", "")
+        static = report._filter_html(report.STATIC_SUB_LINE, [make_record()], web=False)
+        for html in (web, static):
+            self.assertIn('<select id="f-industry"></select>', html)
+            self.assertIn("e => { st.industry=e.target.value;", html)
+            # 建完控件后要把已选值回填，否则"刷新数据"会悄悄清掉筛选
+            self.assertIn("document.getElementById('f-industry').value = st.industry;", html)
+            self.assertIn("else if (k==='industry'){ st.industry='';", html)
+            self.assertIn("(st.industry?1:0)", html)   # 活动条件计数别漏它
+
+    def test_industry_groups_by_first_level_and_keeps_unlabeled_bucket(self):
+        web = report.render_web([make_record()], "T", "")
+        self.assertIn("const indKey = r => String(r.industry || '').split('-')[0].trim();", web)
+        self.assertIn("st.industry === '__none__' ? k : k !== st.industry", web)
+        self.assertIn('${esc(k || \'未标注\')}', web)
+
+
+class TestJobAnalysis(TempDbCase):
+    """匹配度是外部模型算好后回写的本地标注，和 status/note 同一类：
+    采集路径写不到它，重新采集也冲不掉它，接口侧还得把字段和取值收紧。"""
+
+    def one_job(self, pjid="j1"):
+        db.save_jobs([make_record(platform_job_id=pjid)])
+        return pjid
+
+    def test_old_database_gets_the_analysis_table(self):
+        """升级前的库（只有 jobs + job_details）重新 init_db 就能多出分析表。"""
+        import sqlite3
+        old = "".join(line for line in db.SCHEMA.split(
+            "CREATE TABLE IF NOT EXISTS job_analysis")[0])
+        db.DB_PATH.unlink()
+        conn = sqlite3.connect(db.DB_PATH)
+        try:
+            conn.executescript(old)
+            conn.execute("INSERT INTO jobs(platform,platform_job_id,title,fetched_at) "
+                         "VALUES('job51','j1','老职位','2026-09-16 10:00:00')")
+            conn.commit()
+        finally:
+            conn.close()   # Windows 上不关掉句，tearDown 删不掉临时目录
+        db.init_db()
+        self.assertEqual(db.analysis_keys(), [])
+        self.assertEqual(db.fetch_all()[0]["title"], "老职位")
+
+    def test_same_job_overwrites_not_duplicates(self):
+        pjid = self.one_job()
+        db.save_analysis({"platform": "job51", "platform_job_id": pjid, "score": 62})
+        saved = db.save_analysis({"platform": "job51", "platform_job_id": pjid, "score": 88.5})
+        self.assertEqual(saved["score"], 88.5)
+        self.assertEqual(len(db.analysis_keys()), 1)
+
+    def test_recollect_does_not_clobber_the_score(self):
+        pjid = self.one_job()
+        db.save_analysis({"platform": "job51", "platform_job_id": pjid, "score": 77})
+        db.save_jobs([make_record(platform_job_id=pjid)])    # 同一条再采一遍
+        self.assertEqual(db.analysis_keys(), [f"job51:{pjid}"])
+
+    def test_score_bounds_and_types(self):
+        pjid = self.one_job()
+        base = {"platform": "job51", "platform_job_id": pjid}
+        for bad in ("abc", 101, -1):
+            with self.subTest(score=bad), self.assertRaises(ValueError):
+                db.save_analysis(dict(base, score=bad))
+        self.assertEqual(db.analysis_keys(), [])
+        # 模型没给出分数也要落一行，否则外部会把它当成"还没分析过"反复重跑
+        self.assertEqual(db.save_analysis(dict(base, score=None))["score"], None)
+        self.assertEqual(len(db.analysis_keys()), 1)
+        self.assertEqual(db.save_analysis(dict(base, score="73"))["score"], 73.0)
+
+    def test_unknown_job_is_not_written(self):
+        self.assertIsNone(db.save_analysis({"platform": "job51",
+                                            "platform_job_id": "ghost", "score": 90}))
+        self.assertEqual(db.analysis_keys(), [])
+
+    def test_only_analysis_columns_accepted(self):
+        pjid = self.one_job()
+        with self.assertRaises(ValueError) as ctx:
+            db.save_analysis({"platform": "job51", "platform_job_id": pjid,
+                              "score": 1, "prompt_tokens": 12})
+        self.assertIn("白名单", str(ctx.exception))
+
+    def test_collectors_still_cannot_reach_these_columns(self):
+        """新表不能顺手放宽采集白名单——那是合规闸门，不是存储问题。"""
+        for col in ("score", "reasons", "model", "analyzed_at"):
+            self.assertNotIn(col, config.ALLOWED_FIELDS)
+            self.assertNotIn(col, config.ALLOWED_DETAIL_FIELDS)
+        with self.assertRaises(ValueError):
+            db.save_jobs([dict(make_record(), score=90)])
+
+    def test_lists_are_split_capped_and_json_serialised(self):
+        pjid = self.one_job()
+        saved = db.save_analysis({"platform": "job51", "platform_job_id": pjid,
+                                  "score": 70, "matched": "Django, REST 、Python",
+                                  "gaps": ["K8s"], "reasons": "字" * (db.REASONS_MAX + 9),
+                                  "model": "qwen3.5-9b"})
+        self.assertEqual(saved["platform_job_id"], pjid)
+        with db._conn() as c:
+            row = c.execute("SELECT * FROM job_analysis").fetchone()
+        self.assertEqual(json.loads(row["matched"]), ["Django", "REST", "Python"])
+        self.assertEqual(json.loads(row["gaps"]), ["K8s"])
+        self.assertEqual(len(row["reasons"]), db.REASONS_MAX)
+        self.assertEqual(row["model"], "qwen3.5-9b")
+        with self.assertRaises(ValueError):
+            db.save_analysis({"platform": "job51", "platform_job_id": pjid,
+                              "matched": 42})
+
+    def test_missing_keys_are_rejected(self):
+        for body in ({}, {"platform": "job51"}, {"platform_job_id": "j1"}):
+            with self.subTest(body=body), self.assertRaises(ValueError):
+                db.save_analysis(body)
+
+
+def post_api(path: str, body: dict, token: str = "T"):
+    """不打网络地走一遍 Handler 的 POST 分发，拿回它准备发出的 JSON 和状态码。
+
+    服务端固定用 "T"，`token` 是客户端请求头里带的那个，两者不一致就该吃 403。
+    """
+    payload = json.dumps(body).encode("utf-8")
+    h = object.__new__(server.Handler)
+    h.path = path
+    h.headers = {"Content-Length": str(len(payload)), "X-Token": token}
+    h.rfile = io.BytesIO(payload)
+    out = {}
+    h._json = lambda obj, status=200: out.update(obj=obj, status=status)
+    with mock.patch.object(server.Handler, "token", "T"):
+        h.do_POST()
+    return out
+
+
+class TestAnalysisApi(TempDbCase):
+    def test_writes_a_score(self):
+        db.save_jobs([make_record()])
+        res = post_api("/api/analysis", {"platform": "job51", "platform_job_id": "j1",
+                                         "score": 81, "reasons": "技术栈对得上"})
+        self.assertEqual(res["status"], 200)
+        self.assertTrue(res["obj"]["ok"])
+        self.assertEqual(db.analysis_keys(), ["job51:j1"])
+
+    def test_bad_token_is_403(self):
+        res = post_api("/api/analysis", {"platform": "job51", "platform_job_id": "j1",
+                                         "score": 81}, token="wrong")
+        self.assertEqual(res["status"], 403)
+        self.assertEqual(db.analysis_keys(), [])
+
+    def test_invalid_score_is_400_and_unknown_job_is_404(self):
+        self.assertEqual(post_api("/api/analysis", {"platform": "job51",
+                                                    "platform_job_id": "j1",
+                                                    "score": "很高"})["status"], 400)
+        res = post_api("/api/analysis", {"platform": "job51",
+                                         "platform_job_id": "ghost", "score": 50})
+        self.assertEqual(res["status"], 404)
+        self.assertEqual(db.analysis_keys(), [])
+
+    def test_resolve_token(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertNotEqual(server.resolve_token(), server.resolve_token())
+        with mock.patch.dict(os.environ, {server.TOKEN_ENV: " fixed "}):
+            self.assertEqual(server.resolve_token(), "fixed")
+
+
+class TestAnalysisDisplay(TempDbCase):
+    """匹配度是本地算完再读出来的标注，web 页和离线静态页都只显示，不产生。"""
+
+    def test_fetch_all_carries_the_score_columns(self):
+        db.save_jobs([make_record(platform_job_id="j1"),
+                      make_record(platform_job_id="j2", title="另一条")])
+        db.save_analysis({"platform": "job51", "platform_job_id": "j1", "score": 86,
+                          "matched": ["Python"], "gaps": ["K8s"],
+                          "reasons": "技术栈吻合", "model": "qwen3.5-9b"})
+        rows = {r["platform_job_id"]: r for r in db.fetch_all()}
+        self.assertEqual(rows["j1"]["score"], 86)
+        self.assertEqual(rows["j1"]["matched"], ["Python"])
+        self.assertEqual(rows["j1"]["gaps"], ["K8s"])
+        self.assertEqual(rows["j1"]["reasons"], "技术栈吻合")
+        # 没跑过模型的：分数是 None（不是 0），页面据此显示占位符
+        self.assertIsNone(rows["j2"]["score"])
+        self.assertEqual(rows["j2"]["matched"], [])
+
+    def test_fetch_all_works_on_a_database_without_the_analysis_table(self):
+        import sqlite3
+        old = db.SCHEMA.split("CREATE TABLE IF NOT EXISTS job_analysis")[0]
+        db.DB_PATH.unlink()
+        conn = sqlite3.connect(db.DB_PATH)
+        try:
+            conn.executescript(old)
+            conn.execute("INSERT INTO jobs(platform,platform_job_id,title,fetched_at) "
+                         "VALUES('job51','j1','老职位','2026-09-16 10:00:00')")
+            conn.commit()
+        finally:
+            conn.close()
+        rows = db.fetch_all()
+        self.assertEqual(rows[0]["title"], "老职位")
+        self.assertIsNone(rows[0]["score"])
+
+    def test_score_column_in_both_pages(self):
+        rec = dict(make_record(), score=86, reasons="技术栈吻合", gaps=["K8s"])
+        web = report.render_web([rec], "T", "")
+        static = report._filter_html(report.STATIC_SUB_LINE, [rec], web=False)
+        for page in (web, static):
+            self.assertIn("<th>匹配度</th>", page)
+            self.assertIn('<option value="score_desc">匹配度从高到低</option>', page)
+        # 没分数时用占位符，不能显示成 0 分
+        self.assertIn("r.score === null || r.score === undefined", web)
+        # 理由只进 title 属性，且必须转义（模型输出的文本不可信）
+        self.assertIn('`<td title="${esc(why)}">${Math.round(r.score)}</td>`', web)
+
+    def test_export_csv_is_not_widened_by_the_new_column(self):
+        """导出列是显式白名单，加了分析表也不该悄悄多出列来。"""
+        db.save_jobs([make_record()])
+        out = Path(self._tmp.name) / "a.csv"
+        db.export_csv(out)
+        head = out.read_text(encoding="utf-8-sig").splitlines()[0].split(",")
+        self.assertEqual(head, db.EXPORT_FIELDS)
+        self.assertNotIn("score", head)
+
+
+def seed_job_with_detail(pjid="j1", platform="zhitong", description="负责 Python 后端接口"):
+    """造一条「采过了、正文也有了」的职位——它是模型唯一能吃的东西。"""
+    db.save_jobs([make_record(platform=platform, platform_job_id=pjid)])
+    if description is not None:
+        db.save_details([{"platform": platform, "platform_job_id": pjid,
+                          "description": description, "keyword_tags": ["ERP运维"],
+                          "url": f"https://example.com/job/{pjid}"}])
+
+
+class TestPendingAnalysis(TempDbCase):
+    """待分析清单必须只从本地库里挑：拉一批待办绝不能顺带访问招聘平台。"""
+
+    def test_needs_a_body_and_no_score_yet(self):
+        seed_job_with_detail("j1")
+        seed_job_with_detail("j2", description=None)     # 缺正文：要它就得去开详情页
+        seed_job_with_detail("j3")
+        db.save_analysis({"platform": "zhitong", "platform_job_id": "j3", "score": 70})
+        rows = db.pending_analysis()
+        self.assertEqual([r["platform_job_id"] for r in rows], ["j1"])
+        self.assertEqual(rows[0]["description"], "负责 Python 后端接口")
+        self.assertEqual(rows[0]["keyword_tags"], ["ERP运维"])
+        # 技能仍走读取侧口径，喂给模型的和筛选台上看到的是同一套
+        self.assertEqual(rows[0]["skills"], ["Python", "Django"])
+        self.assertEqual(rows[0]["status"], "")
+
+    def test_redo_platform_filter_and_limit(self):
+        for i in ("1", "2", "3"):
+            seed_job_with_detail(f"j{i}")
+        self.assertEqual(len(db.pending_analysis(limit=2)), 2)
+        self.assertEqual(len(db.pending_analysis(limit=0)), 1)   # 下限兜住，别空跑
+        db.save_analysis({"platform": "zhitong", "platform_job_id": "j1", "score": 55})
+        self.assertEqual(len(db.pending_analysis()), 2)
+        self.assertEqual(len(db.pending_analysis(redo=True)), 3)
+        seed_job_with_detail("z1", platform="job51")
+        self.assertEqual({r["platform_job_id"]
+                          for r in db.pending_analysis(platform="job51")}, {"z1"})
+
+    def test_database_without_any_detail_table(self):
+        import sqlite3
+        old = db.SCHEMA.split("CREATE TABLE IF NOT EXISTS job_details")[0]
+        db.DB_PATH.unlink()
+        conn = sqlite3.connect(db.DB_PATH)
+        try:
+            conn.executescript(old)
+            conn.execute("INSERT INTO jobs(platform,platform_job_id,title,fetched_at) "
+                         "VALUES('job51','j1','老职位','2026-09-16 10:00:00')")
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(db.pending_analysis(), [])
+
+    def test_old_database_without_the_analysis_table(self):
+        """只有 jobs + job_details 的老库：正文都算没分析过，不能因为缺表就报错。"""
+        import sqlite3
+        old = db.SCHEMA.split("CREATE TABLE IF NOT EXISTS job_analysis")[0]
+        db.DB_PATH.unlink()
+        conn = sqlite3.connect(db.DB_PATH)
+        try:
+            conn.executescript(old)
+            conn.execute("INSERT INTO jobs(platform,platform_job_id,title,fetched_at) "
+                         "VALUES('zhitong','j1','IT运维','2026-09-16 10:00:00')")
+            conn.execute("INSERT INTO job_details(platform,platform_job_id,description) "
+                         "VALUES('zhitong','j1','正文')")
+            conn.commit()
+        finally:
+            conn.close()
+        rows = db.pending_analysis()
+        self.assertEqual([r["platform_job_id"] for r in rows], ["j1"])
+
+
+def get_api(path: str, token: str = "T"):
+    """同 post_api：不打网络走一遍 GET 分发，拿回准备发出的 JSON 和状态码。"""
+    h = object.__new__(server.Handler)
+    h.path = path
+    h.headers = {"X-Token": token}
+    out = {}
+    h._json = lambda obj, status=200: out.update(obj=obj, status=status)
+    with mock.patch.object(server.Handler, "token", "T"):
+        h.do_GET()
+    return out
+
+
+class TestPendingAnalysisApi(TempDbCase):
+    """n8n 侧的只读口子：一次就给够「职位 + 正文」，省掉逐条回查。"""
+
+    def test_returns_jobs_with_their_body(self):
+        seed_job_with_detail("j1")
+        seed_job_with_detail("j2", description=None)
+        res = get_api("/api/pending_analysis?limit=5&platform=zhitong")
+        self.assertEqual(res["status"], 200)
+        jobs = res["obj"]["jobs"]
+        self.assertEqual([j["platform_job_id"] for j in jobs], ["j1"])
+        self.assertIn("Python", jobs[0]["description"])
+
+    def test_bad_token_is_403(self):
+        self.assertEqual(get_api("/api/pending_analysis", token="wrong")["status"], 403)
+
+    def test_garbage_or_huge_limit_does_not_break(self):
+        seed_job_with_detail("j1")
+        for q in ("", "?limit=abc", "?limit=100000", "?redo=1&platform="):
+            with self.subTest(query=q):
+                res = get_api("/api/pending_analysis" + q)
+                self.assertEqual(res["status"], 200)
+                self.assertEqual(len(res["obj"]["jobs"]), 1)
+
+    def test_redo_brings_back_analyzed_jobs(self):
+        seed_job_with_detail("j1")
+        db.save_analysis({"platform": "zhitong", "platform_job_id": "j1", "score": 60})
+        self.assertEqual(get_api("/api/pending_analysis")["obj"]["jobs"], [])
+        self.assertEqual(len(get_api("/api/pending_analysis?redo=true")["obj"]["jobs"]), 1)
+
+
+class TestLocalModelAnalysis(TempDbCase):
+    """本机模型这一段全是纯本地：自述在文件里、请求只发往 127.0.0.1、结果写 job_analysis。"""
+
+    def setUp(self):
+        super().setUp()
+        self.profile = Path(self._tmp.name) / "profile.txt"
+        self.profile.write_text("我会 Python 三年，写过爬虫和 Flask 接口；期望深圳，"
+                                "月薪 15K 起；不接受长期出差。", encoding="utf-8")
+        seed_job_with_detail("j1")
+        self.job = db.pending_analysis()[0]
+
+    def test_missing_profile_tells_you_what_to_write(self):
+        self.profile.unlink()
+        with self.assertRaises(RuntimeError) as ctx:
+            analyze.load_profile(self.profile)
+        self.assertIn("自述文件", str(ctx.exception))
+        self.assertIn("data", str(ctx.exception))
+        with self.assertRaises(RuntimeError):
+            self.profile.write_text("随便", encoding="utf-8")
+            analyze.load_profile(self.profile)
+        self.profile.write_text("x" * (analyze.PROFILE_MAX + 500), encoding="utf-8")
+        self.assertEqual(len(analyze.load_profile(self.profile)), analyze.PROFILE_MAX)
+
+    def test_prompt_carries_the_job_and_truncates_a_long_body(self):
+        job = dict(self.job, description="岗" * (config.JD_MAX_CHARS + 300))
+        msgs = analyze.build_messages(job, analyze.load_profile(self.profile))
+        self.assertEqual(msgs[0]["role"], "system")
+        self.assertIn("90 以上", msgs[0]["content"])       # 打分细则钉在提示词里
+        user = msgs[1]["content"]
+        self.assertIn("Python开发工程师", user)
+        self.assertIn("15-25K·14薪", user)
+        self.assertIn("我会 Python 三年", user)
+        self.assertIn("已截断", user)
+        self.assertLess(len(user), config.JD_MAX_CHARS + 1500)
+
+    def test_job_without_a_body_says_so(self):
+        user = analyze.build_messages(dict(self.job, description=""), "我")[1]["content"]
+        self.assertIn("没有正文", user)
+
+    def test_extract_json_survives_wrapping(self):
+        cases = {
+            '{"score": 88}': {"score": 88},
+            '```json\n{"score": 70}\n```': {"score": 70},
+            '好的，结果如下：\n{"score": 65,"reasons":"技能对得上"}': {"score": 65,
+                                                                       "reasons": "技能对得上"},
+            '{"score": 60, "reasons": "带\\"引号\\"和{花括号}都别断"}':
+                {"score": 60, "reasons": '带"引号"和{花括号}都别断'},
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw[:20]):
+                self.assertEqual(analyze.extract_json(raw), expected)
+        for bad in ("我觉得不太合适", '{"score": 60', 'not json: {"score": [}'):
+            with self.subTest(raw=bad), self.assertRaises(ValueError):
+                analyze.extract_json(bad)
+
+    def test_parse_result_shapes_what_db_expects(self):
+        got = analyze.parse_result('{"score": 82, "matched": ["Python"], "gaps": ["K8s"],'
+                                   ' "reasons": "技术栈吻合"}', self.job, "qwen3.5-9b")
+        self.assertEqual(got["platform"], "zhitong")
+        self.assertEqual(got["platform_job_id"], "j1")
+        self.assertEqual(got["score"], 82)
+        self.assertEqual(got["model"], "qwen3.5-9b")
+        with self.assertRaises(ValueError):
+            analyze.parse_result('{"matched": []}', self.job, "m")
+
+    def test_chat_payload_is_deterministic(self):
+        sent = {}
+
+        class Resp:
+            def read(self):
+                return json.dumps({"choices": [{"message": {"content": "{}"}}]}).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            sent["url"] = req.full_url
+            sent["body"] = json.loads(req.data.decode("utf-8"))
+            return Resp()
+
+        with mock.patch.object(analyze.urllib.request, "urlopen", fake_urlopen):
+            out = analyze.post_chat([{"role": "user", "content": "hi"}],
+                                    "http://127.0.0.1:1234/v1/", "qwen3.5-9b")
+        self.assertEqual(out, "{}")
+        self.assertEqual(sent["url"], "http://127.0.0.1:1234/v1/chat/completions")
+        self.assertEqual(sent["body"]["model"], "qwen3.5-9b")
+        self.assertEqual(sent["body"]["temperature"], 0)
+        self.assertFalse(sent["body"]["stream"])
+
+    def test_empty_model_output_is_a_failure(self):
+        class Resp:
+            def read(self):
+                return json.dumps({"choices": [{"message": {"content": "   "}}]}).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        with mock.patch.object(analyze.urllib.request, "urlopen",
+                               lambda req, timeout=None: Resp()):
+            with self.assertRaises(RuntimeError):
+                analyze.post_chat([{"role": "user", "content": "x"}],
+                                  "http://127.0.0.1:1234/v1", "m")
+
+    def test_scores_land_in_the_database(self):
+        with mock.patch.object(analyze, "post_chat",
+                               return_value='{"score": 87, "reasons": "对得上"}') as chat, \
+                mock.patch("builtins.print"):
+            res = analyze.analyze_jobs([self.job], profile="我会 Python",
+                                       url="http://127.0.0.1:1234/v1", model="qwen3.5-9b")
+        self.assertEqual({k: res[k] for k in ("analyzed", "failed")},
+                         {"analyzed": 1, "failed": 0})
+        self.assertGreaterEqual(res["seconds"], 0)   # 耗时是逐条记的，别信"9B 应该慢"这种猜
+        self.assertEqual(chat.call_args[0][1], "http://127.0.0.1:1234/v1")
+        row = {r["platform_job_id"]: r for r in db.fetch_all()}["j1"]
+        self.assertEqual(row["score"], 87)
+        self.assertEqual(row["model"], "qwen3.5-9b")
+
+    def test_one_bad_answer_skips_that_job_only(self):
+        answers = ['{"matched": []}', '{"score": 50}']
+        with mock.patch.object(analyze, "post_chat", side_effect=answers), \
+                mock.patch("builtins.print"):
+            seed_job_with_detail("j2")
+            res = analyze.analyze_jobs(db.pending_analysis(), profile="我", model="m")
+        self.assertEqual({k: res[k] for k in ("analyzed", "failed")},
+                         {"analyzed": 1, "failed": 1})
+        # 到底是哪条成功的不保证（同一秒采的），但另一条必须照常跑完并落库
+        self.assertEqual(len(db.analysis_keys()), 1)
+
+    def test_three_failures_in_a_row_stop_the_whole_run(self):
+        """连着失败多半是接口或模型没配好，别把二十条都耗在同一个坑里。"""
+        seed_job_with_detail("j2")
+        seed_job_with_detail("j3")
+        with mock.patch.object(analyze, "post_chat",
+                               side_effect=RuntimeError("连不上")), \
+                mock.patch("builtins.print"):
+            with self.assertRaises(RuntimeError) as ctx:
+                analyze.analyze_jobs(db.pending_analysis(), profile="我", model="m")
+        self.assertIn("停手", str(ctx.exception))
+        self.assertEqual(db.analysis_keys(), [])
+
+    def test_dry_run_never_calls_the_model_or_writes(self):
+        with mock.patch.object(analyze, "post_chat",
+                               side_effect=AssertionError("不该发请求")), \
+                mock.patch("builtins.print") as out:
+            res = analyze.analyze_jobs([self.job], profile="我", dry_run=True)
+        self.assertEqual(res["analyzed"], 0)
+        self.assertEqual(db.analysis_keys(), [])
+        printed = "".join(str(c) for c in out.call_args_list)
+        self.assertIn("预览", printed)
+
+    def test_run_picks_the_loaded_model_and_reports(self):
+        with mock.patch.object(analyze, "list_models", return_value=["qwen3.5-9b"]), \
+                mock.patch.object(analyze, "post_chat",
+                                  return_value='{"score": 71}') as chat, \
+                mock.patch("builtins.print") as out:
+            res = analyze.run(profile_path=self.profile, model="")
+        self.assertEqual(res["analyzed"], 1)
+        self.assertEqual(chat.call_args[0][2], "qwen3.5-9b")
+        self.assertEqual(db.analysis_keys(), ["zhitong:j1"])
+        # 报了平均秒数才知道一晚跑二十条到底要多久
+        self.assertIn("秒/条", "".join(str(c) for c in out.call_args_list))
+
+    def test_run_without_an_explicit_model_needs_a_loaded_one(self):
+        with mock.patch.object(analyze, "list_models", return_value=[]):
+            with self.assertRaises(RuntimeError) as ctx:
+                analyze.resolve_model("http://127.0.0.1:1234/v1")
+        self.assertIn("加载", str(ctx.exception))
+        self.assertEqual(analyze.resolve_model("http://x/v1", "qwen3.5-9b"), "qwen3.5-9b")
+
+    def test_run_with_nothing_to_do_says_so(self):
+        db.DB_PATH.unlink()
+        db.init_db()
+        with mock.patch.object(analyze, "post_chat",
+                               side_effect=AssertionError("不该发请求")), \
+                mock.patch("builtins.print") as out:
+            res = analyze.run(profile_path=self.profile)
+        self.assertEqual(res, {"analyzed": 0, "failed": 0, "seconds": 0.0})
+        self.assertIn("detail", "".join(str(c) for c in out.call_args_list))
+
+class TrashCase(TempDbCase):
+    """删除依赖 data/trash 里的批次文件；测试把回收站挪进临时目录，不碰真那个。"""
+
+    def setUp(self):
+        super().setUp()
+        self.trash = Path(self._tmp.name) / "trash"
+        self._orig_trash = db.TRASH_DIR
+        db.TRASH_DIR = self.trash
+
+    def tearDown(self):
+        db.TRASH_DIR = self._orig_trash
+        super().tearDown()
+
+
+def seed_deletable(pjid="j1", platform="zhitong"):
+    """采过、有正文、有匹配度、也标过状态的职位——删的时候要三张表一起走。"""
+    seed_job_with_detail(pjid, platform=platform)
+    db.save_analysis({"platform": platform, "platform_job_id": pjid, "score": 88,
+                      "matched": ["Python"], "gaps": ["K8s"], "reasons": "对口"})
+    row = next(r for r in db.fetch_all() if r["platform_job_id"] == pjid)
+    db.set_status(row["id"], "想投", "已看过 JD")
+    return row["id"]
+
+
+class TestJobDeletion(TrashCase):
+    def test_delete_takes_body_and_score_with_it(self):
+        jid = seed_deletable()
+        res = db.delete_jobs([jid])
+        self.assertEqual(res["deleted"], 1)
+        self.assertEqual(res["details"], 1)
+        self.assertEqual(res["analysis"], 1)
+        self.assertEqual(db.fetch_all(), [])
+        self.assertEqual(db.detail_keys(), [])
+        self.assertEqual(db.analysis_keys(), [])
+        self.assertTrue((self.trash / res["batch"]).exists())
+
+    def test_undo_puts_back_marks_and_score(self):
+        jid = seed_deletable()
+        batch = db.delete_jobs([jid])["batch"]
+        res = db.restore_batch(batch)
+        self.assertEqual((res["jobs"], res["details"], res["analysis"]), (1, 1, 1))
+        r = db.fetch_all()[0]
+        self.assertEqual(r["status"], "想投")
+        self.assertEqual(r["note"], "已看过 JD")
+        self.assertEqual(r["score"], 88)
+        self.assertEqual(r["skills"], ["Python", "Django"])
+        self.assertEqual(db.get_detail("zhitong", "j1")["description"], "负责 Python 后端接口")
+        self.assertEqual(db.trash_batches(), [])      # 批次用完即废
+
+    def test_undo_keeps_the_last_seen_date(self):
+        """撤销得把 last_seen_at 一起放回来。它不在采集列里，以前撤销后只剩
+        fetched_at，而页面的 seenAt 是 last_seen_at || fetched_at——第一次采到
+        在 14 天前的在职职位，撤回来就会被标成「疑似已下架」。"""
+        jid = seed_deletable()
+        with db._conn() as c:
+            c.execute("UPDATE jobs SET last_seen_at='2026-10-20 21:27:31' WHERE id=?", (jid,))
+        batch = db.delete_jobs([jid])["batch"]
+        db.restore_batch(batch)
+        r = db.fetch_all()[0]
+        self.assertEqual(r["last_seen_at"], "2026-10-20 21:27:31")
+        self.assertNotEqual(r["last_seen_at"], r["fetched_at"])
+
+    def test_a_batch_can_only_be_undoned_once(self):
+        batch = db.delete_jobs([seed_deletable()])["batch"]
+        self.assertIsNotNone(db.restore_batch(batch))
+        self.assertIsNone(db.restore_batch(batch))
+
+    def test_undo_does_not_clobber_a_newer_mark(self):
+        """撤销用的是 INSERT OR IGNORE：删后又放出来重采/又标的，以库里当下那条为准。"""
+        batch = db.delete_jobs([seed_deletable()])["batch"]
+        db.unblock_jobs(["zhitong:j1"])         # 屏蔽名单不放回去，这条根本采不回来
+        db.save_jobs([make_record(platform="zhitong", platform_job_id="j1")])
+        new = db.fetch_all()[0]
+        db.set_status(new["id"], "已投")
+        res = db.restore_batch(batch)
+        self.assertEqual(res["jobs"], 0)
+        rows = db.fetch_all()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "已投")
+
+    def test_delete_blocks_future_collects(self):
+        """删过的职位进屏蔽名单：第二天再采同一个关键词不会把它原样带回来。"""
+        jid = seed_deletable()
+        db.delete_jobs([jid])
+        st = db.save_stats([make_record(platform="zhitong", platform_job_id="j1")])
+        self.assertEqual((st["added"], st["refreshed"], st["blocked"]), (0, 0, 1))
+        self.assertEqual(db.fetch_all(), [])
+        self.assertEqual([(r["platform"], r["platform_job_id"]) for r in db.blocked_list()],
+                         [("zhitong", "j1")])
+
+    def test_undo_clears_the_block(self):
+        """撤销一批删除要连屏蔽名单一起退，不然职位回来了却永远不再被刷新。"""
+        batch = db.delete_jobs([seed_deletable()])["batch"]
+        db.restore_batch(batch)
+        self.assertEqual(db.blocked_list(), [])
+        st = db.save_stats([make_record(platform="zhitong", platform_job_id="j1")])
+        self.assertEqual((st["added"], st["refreshed"], st["blocked"]), (0, 1, 0))
+
+    def test_unblock_accepts_a_whole_platform(self):
+        jid = seed_deletable()
+        db.delete_jobs([jid])
+        self.assertEqual(db.unblock_jobs(["zhitong:*"]), 1)
+        self.assertEqual(db.blocked_list(), [])
+
+    def test_bad_input_never_touches_the_database(self):
+        jid = seed_deletable()
+        for bad in ([], ["abc"], [9999], list(range(1, db.DELETE_MAX + 2))):
+            with self.assertRaises(ValueError):
+                db.delete_jobs(bad)
+        self.assertEqual(len(db.fetch_all()), 1)
+        self.assertFalse(self.trash.exists())
+        with self.assertRaises(ValueError) as ctx:
+            db.delete_jobs(list(range(1, db.DELETE_MAX + 2)))
+        self.assertIn(str(db.DELETE_MAX), str(ctx.exception))
+
+    def test_batch_name_cannot_point_outside_the_trash(self):
+        for bad in ("../jobs.db", "jobs.db", "", None, "20261011-225033-82bc3c.json/x"):
+            with self.assertRaises(ValueError):
+                db.restore_batch(bad)
+
+    def test_batches_are_listed_with_their_titles(self):
+        a = seed_deletable("j1")
+        b = seed_deletable("j2")
+        db.delete_jobs([a])
+        db.delete_jobs([b])
+        batches = db.trash_batches()
+        self.assertEqual(len(batches), 2)
+        self.assertEqual(sorted(x["jobs"] for x in batches), [1, 1])
+        self.assertTrue(all(x["titles"] and x["deleted_at"] for x in batches))
+
+    def test_trash_keeps_only_the_newest_batches(self):
+        for _ in range(db.TRASH_KEEP + 5):
+            db._write_trash({"deleted_at": "", "jobs": [], "details": [], "analysis": []})
+        self.assertEqual(len(list(self.trash.glob("*.json"))), db.TRASH_KEEP)
+
+    def test_a_broken_trash_file_does_not_hide_the_rest(self):
+        b1 = db.delete_jobs([seed_deletable("j1")])["batch"]
+        b2 = db.delete_jobs([seed_deletable("j2")])["batch"]
+        (self.trash / b1).write_text("{不是 JSON", encoding="utf-8")
+        self.assertEqual([x["batch"] for x in db.trash_batches()], [b2])
+
+
+class TestDeleteApi(TrashCase):
+    def test_delete_then_restore_through_the_api(self):
+        jid = seed_deletable()
+        res = post_api("/api/delete", {"ids": [jid]})
+        self.assertEqual(res["status"], 200)
+        self.assertTrue(res["obj"]["ok"])
+        self.assertEqual(res["obj"]["deleted"], 1)
+        self.assertEqual(db.fetch_all(), [])
+        back = post_api("/api/restore", {"batch": res["obj"]["batch"]})
+        self.assertEqual(back["status"], 200)
+        self.assertEqual(len(db.fetch_all()), 1)
+        self.assertEqual(post_api("/api/restore", {"batch": res["obj"]["batch"]})["status"], 404)
+
+    def test_bad_token_cannot_delete_anything(self):
+        jid = seed_deletable()
+        res = post_api("/api/delete", {"ids": [jid]}, token="wrong")
+        self.assertEqual(res["status"], 403)
+        self.assertEqual(len(db.fetch_all()), 1)
+        self.assertFalse(self.trash.exists())
+
+    def test_wrong_shapes_are_400_not_500(self):
+        jid = seed_deletable()
+        self.assertEqual(post_api("/api/delete", {"ids": jid})["status"], 400)
+        self.assertEqual(post_api("/api/delete", {"ids": [9999]})["status"], 400)
+        self.assertEqual(post_api("/api/restore", {"batch": "../x"})["status"], 400)
+        self.assertEqual(len(db.fetch_all()), 1)
+
+    def test_trash_endpoint_is_tokened_too(self):
+        db.delete_jobs([seed_deletable()])
+        res = get_api("/api/trash")
+        self.assertEqual(res["status"], 200)
+        self.assertEqual(len(res["obj"]["batches"]), 1)
+        self.assertEqual(get_api("/api/trash", token="wrong")["status"], 403)
+
+
+class TestDeleteUi(unittest.TestCase):
+    """删除只在服务版页面上有；导出的静态页连按钮都不该出现。"""
+
+    def test_web_page_has_the_controls_static_page_has_none(self):
+        rec = dict(make_record(), id=1)
+        web = report.render_web([rec], "T", "")
+        for needle in ("<th>删</th>", 'id="btn-del-filtered"', "撤销这次删除",
+                       "async function askDelete", "async function loadTrash",
+                       "'/api/delete'", "'/api/restore'", "'/api/trash'",
+                       'data-del="${esc(r.id)}'):
+            self.assertIn(needle, web)
+        static = report._filter_html(report.STATIC_SUB_LINE, [rec], web=False)
+        for needle in ("<th>删</th>", "async function askDelete", "id=\"btn-del-filtered\"",
+                       "loadTrash()", "/api/delete"):
+            self.assertNotIn(needle, static)
+
+    def test_confirm_text_says_it_touches_no_platform(self):
+        web = report.render_web([], "T", "")
+        self.assertIn("不会访问任何招聘平台", web)
+        self.assertIn("data/trash", web)
+
+
+class TestDetailIdsArg(TempDbCase):
+    """`detail --ids` 是"只给这几种抓正文"的口子，参数写错时最坏能把一天额度花光。"""
+
+    def _run(self, **over):
+        from types import SimpleNamespace
+        args = SimpleNamespace(platform=None, ids=None, limit=None, force=False)
+        for k, v in over.items():
+            setattr(args, k, v)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cli.cmd_detail(args)
+        return buf.getvalue()
+
+    def test_empty_ids_refuses_instead_of_falling_into_bulk(self):
+        # 以前写成 `if args.ids:`，空串被当成"没给这个参数"，直接掉进自动补抓，
+        # 实测一天 20 条正文额度静默花光，用户以为只是查了一下。
+        db.save_jobs([make_record(platform="zhitong", platform_job_id="j1")])
+        with mock.patch.object(details, "collect_details") as grab, \
+                mock.patch.object(db, "jobs_missing_details",
+                                  return_value=[{"id": 1}]) as pick:
+            with self.assertRaises(RuntimeError) as cm:
+                self._run(ids="")
+            self.assertIn("空的", str(cm.exception))
+            grab.assert_not_called()
+            pick.assert_not_called()
+
+    def test_non_numeric_ids_gives_a_chinese_line_not_a_traceback(self):
+        with mock.patch.object(db, "jobs_by_ids") as lookup, \
+                mock.patch.object(details, "collect_details") as grab:
+            with self.assertRaises(RuntimeError) as cm:
+                self._run(ids="562,56a")
+        self.assertIn("不是行号", str(cm.exception))
+        lookup.assert_not_called()
+        grab.assert_not_called()
+
+    def test_ids_that_match_nothing_says_so(self):
+        # 不能落到下面那句"都已经有正文了，或今日额度用完"上，那是另一个原因
+        with mock.patch.object(db, "jobs_by_ids", return_value=[]), \
+                mock.patch.object(details, "collect_details") as grab:
+            text = self._run(ids="99998,99999")
+        self.assertIn("都找不到", text)
+        grab.assert_not_called()
+
+    def test_given_ids_fetch_only_those(self):
+        db.save_jobs([make_record(platform="zhitong", platform_job_id="j1"),
+                      make_record(platform="zhitong", platform_job_id="j2")])
+        picked = [r for r in db.fetch_all() if r["platform_job_id"] == "j2"]
+        with mock.patch.object(db, "jobs_by_ids", return_value=picked) as lookup, \
+                mock.patch.object(details, "collect_details", return_value={}) as grab:
+            self._run(ids="42")
+        lookup.assert_called_once_with([42])
+        grab.assert_called_once_with(picked, limit=None, force=False)
+
+
+class TestUtf8Stdout(unittest.TestCase):
+    """重定向/管道时 stdout 会退回机器代码页（这台是 cp936），标题里一个表情就能打断整条命令。"""
+
+    def test_piped_stdout_survives_a_non_gbk_title(self):
+        buf = io.BytesIO()
+        fake = io.TextIOWrapper(buf, encoding="gbk", newline="")
+        with mock.patch.object(sys, "stdout", fake), mock.patch.object(sys, "stderr", fake):
+            cli._force_utf8_output()
+            self.assertEqual(sys.stdout.encoding.lower().replace("-", ""), "utf8")
+            print("🔥 IT运维")   # 不改编码的话这一句就 UnicodeEncodeError
+            sys.stdout.flush()
+        self.assertIn("🔥", buf.getvalue().decode("utf-8"))
+
+    def test_a_stdout_without_reconfigure_is_left_alone(self):
+        # 测试里 redirect_stdout 换进来的是 StringIO，没有 reconfigure；不许因此炸
+        with redirect_stdout(io.StringIO()) as buf:
+            cli._force_utf8_output()
+            print("照常")
+        self.assertIn("照常", buf.getvalue())
+
+
+def get_api(path: str, token: str = "T"):
+    """同 post_api：不打网络走一遍 GET 分发，拿回它准备发出的 JSON 和状态码。"""
+    h = object.__new__(server.Handler)
+    h.path = path
+    h.headers = {"X-Token": token}
+    out = {}
+    h._json = lambda obj, status=200: out.update(obj=obj, status=status)
+    with mock.patch.object(server.Handler, "token", "T"):
+        h.do_GET()
+    return out
+
+
+class TestApiCatchAll(TempDbCase):
+    """路由里冒出来的异常必须变成一条带原因的错误，不能把连接掐断让用户看 "Failed to fetch"。"""
+
+    def test_db_error_on_get_returns_500_with_the_reason(self):
+        import sqlite3
+        err = sqlite3.OperationalError("no such table: job_analysis")
+        with mock.patch.object(db, "fetch_all", side_effect=err):
+            res = get_api("/api/jobs")
+        self.assertEqual(res["status"], 500)
+        self.assertFalse(res["obj"]["ok"])
+        self.assertIn("no such table: job_analysis", res["obj"]["error"])
+
+    def test_db_error_on_post_returns_500_with_the_reason(self):
+        with mock.patch.object(db, "set_status", side_effect=OSError("磁盘没空间")):
+            res = post_api("/api/status", {"id": 1, "status": "想投"})
+        self.assertEqual(res["status"], 500)
+        self.assertIn("磁盘没空间", res["obj"]["error"])
+
+    def test_client_already_gone_gets_no_response(self):
+        # 刷新/关标签时连接先没了，这时候再想发响应就是第二层异常
+        sent = []
+        h = object.__new__(server.Handler)
+        h.path = "/api/jobs"
+        h.headers = {"X-Token": "T"}
+        h._json = lambda obj, status=200: sent.append(obj)
+        with mock.patch.object(server.Handler, "token", "T"), \
+                mock.patch.object(db, "fetch_all", side_effect=BrokenPipeError):
+            self.assertIsNone(h.do_GET())
+        self.assertEqual(sent, [])
+
+
+class TestSalaryReadSide(TempDbCase):
+    """薪资数值列是入库那一刻算的；口径升级之前入库的老行得在读取侧补回来，不改库。"""
+
+    def _seed_old_row(self, raw, pjid="j1"):
+        db.save_jobs([dict(make_record(platform="zhitong", platform_job_id=pjid,
+                                       salary_raw=raw, salary_min=None,
+                                       salary_max=None, salary_months=None))])
+
+    def _stored(self, pjid="j1"):
+        import sqlite3
+        conn = sqlite3.connect(db.DB_PATH)
+        try:
+            return conn.execute("SELECT salary_min, salary_max FROM jobs"
+                                " WHERE platform_job_id=?", (pjid,)).fetchone()
+        finally:
+            conn.close()
+
+    def test_old_row_gets_its_range_back_on_read(self):
+        self._seed_old_row("7千-1.3万")
+        self.assertEqual(self._stored(), (None, None))   # 库里确实是空的
+        row = db.fetch_all()[0]
+        self.assertEqual((row["salary_min"], row["salary_max"]), (7.0, 13.0))
+        self.assertEqual(row["salary_months"], 12)
+        self.assertEqual(db.annual_wan(row), 12.0)
+
+    def test_read_side_fallback_does_not_rewrite_the_library(self):
+        self._seed_old_row("8千-1.2万")
+        db.fetch_all()
+        self.assertEqual(self._stored(), (None, None))
+
+    def test_negotiable_salary_stays_empty(self):
+        self._seed_old_row("面议")
+        row = db.fetch_all()[0]
+        self.assertIsNone(row["salary_min"])
+        self.assertIsNone(db.annual_wan(row))
+
+    def test_boss_only_k_format_is_untouched(self):
+        self._seed_old_row("15-25K", pjid="b1")
+        row = next(r for r in db.fetch_all() if r["platform_job_id"] == "b1")
+        self.assertEqual((row["salary_min"], row["salary_max"]), (15.0, 25.0))
+
+
+class TestSalaryCharts(unittest.TestCase):
+    def _rec(self, pjid, lo, hi):
+        return dict(make_record(platform="zhitong", platform_job_id=pjid,
+                                salary_raw=f"{lo}-{hi}K", salary_min=float(lo),
+                                salary_max=float(hi)))
+
+    def test_top_bin_has_no_ceiling(self):
+        # 以前最后一档是 60-100k：一条 12 万的岗位哪个档都不落，
+        # 柱子加起来比总数小，读起来像"高薪岗位更少"
+        stats = report.build_stats([self._rec("a", 120, 120), self._rec("b", 8, 8)])
+        self.assertEqual(sum(stats["salary_hist_values"]), 2)
+        self.assertEqual(stats["salary_hist_labels"][-1], "100k以上")
+
+    def test_both_sides_use_the_two_middle_rule(self):
+        four = [self._rec("a", 10, 10), self._rec("b", 12, 12),
+                self._rec("c", 14, 14), self._rec("d", 100, 100)]
+        # 报告侧：偶数条取中间两个的平均 = 13.0（取上中位会是 14.0）
+        self.assertEqual(report.build_stats(four)["salary_median"], 13.0)
+        web = report.render_web(four, "T", "")
+        self.assertIn("function median(", web)
+        self.assertIn("(sorted[n/2-1] + sorted[n/2]) / 2", web)
+        self.assertNotIn("Math.floor(mids.length/2)", web)
+
+
+class TestTrashAtomic(TrashCase):
+    def test_batch_file_is_the_only_thing_left_behind(self):
+        name = db._write_trash({"deleted_at": "2026-10-22 00:00:00",
+                                "jobs": [make_record()], "details": [], "analysis": []},
+                               self.trash)
+        left = sorted(p.name for p in self.trash.iterdir())
+        self.assertEqual(left, [name])   # 没有 .tmp 残留
+        payload = json.loads((self.trash / name).read_text(encoding="utf-8"))
+        self.assertEqual(payload["jobs"][0]["platform_job_id"], "j1")
+
+    def test_delete_leaves_no_temp_file_and_still_offers_undo(self):
+        jid = seed_deletable()
+        db.delete_jobs([jid], trash_dir=self.trash)
+        self.assertEqual([p.name for p in self.trash.iterdir()
+                          if p.suffix != ".json"], [])
+        self.assertEqual(len(db.trash_batches(self.trash)), 1)
+
+
+class TestLaunchCleansDriver(unittest.TestCase):
+    """两次通道都起不来时，那个 Playwright driver 子进程已经归我们管了。"""
+
+    def _fake_pw(self, side_effect):
+        # launch() 里拿的是 sync_playwright().start()，驱动要挂在 start 的返回值上
+        driver = mock.Mock()
+        driver.chromium.launch.side_effect = side_effect
+        mgr = mock.Mock()
+        mgr.start.return_value = driver
+        return mock.patch.object(browser, "sync_playwright", return_value=mgr), driver
+
+    def test_both_channels_failing_stops_the_driver(self):
+        patch, driver = self._fake_pw([PlaywrightError("没有 Chrome"),
+                                       PlaywrightError("没装 Chromium")])
+        with patch:
+            with self.assertRaises(PlaywrightError):
+                browser.launch()
+        driver.stop.assert_called_once()
+
+    def test_fallback_channel_keeps_the_driver(self):
+        patch, driver = self._fake_pw([PlaywrightError("没有 Chrome"), mock.Mock()])
+        with patch:
+            p, _br = browser.launch()
+        self.assertIs(p, driver)
+        driver.stop.assert_not_called()
+
+
+class TestUnfilledProfile(unittest.TestCase):
+    """自述文件是匹配度的尺子：【】没填完，就不能报"已就绪"，更不能拿它算分。"""
+
+    def _profile(self, text):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        p = Path(tmp.name) / "profile.txt"
+        p.write_text(text, encoding="utf-8")
+        return p
+
+    def test_placeholders_are_counted(self):
+        self.assertEqual(analyze.placeholders("年限：【几年】，下限【例：8k】"),
+                         ["【几年】", "【例：8k】"])
+        self.assertEqual(analyze.placeholders("Python 三年，期望东莞，8k 起"), [])
+
+    def test_analyze_refuses_a_template_profile(self):
+        p = self._profile("总工作年限：【几年】\n能接受的月薪下限：【例：8k】\n"
+                          "学历 / 专业：【例：大专 计算机应用技术】\n")
+        with self.assertRaises(RuntimeError) as ctx:
+            analyze.load_profile(p)
+        msg = str(ctx.exception)
+        self.assertIn("3 处【】没填", msg)
+        self.assertIn("没刻度", msg)
+        # 拦下来得同时给一条立刻能用的出路，不然他只知道跑不了
+        self.assertIn("--dry-run", msg)
+
+    def test_dry_run_still_previews_a_template(self):
+        # 预览不发消息也不写库，占位没填也该让他看清提示词长什么样
+        p = self._profile("总工作年限：【几年】，其余内容凑够十个字以上")
+        self.assertIn("【几年】", analyze.load_profile(p, allow_placeholders=True))
+
+    def test_filled_profile_passes(self):
+        p = self._profile("总工作年限：3 年\n月薪下限：8k\n学历：大专 计算机应用技术")
+        self.assertIn("8k", analyze.load_profile(p))
+
+    def test_status_names_the_unfilled_placeholders(self):
+        p = self._profile("总工作年限：【几年】\n月薪下限：【例：8k】\n学历：大专 计算机")
+        buf = io.StringIO()
+        with mock.patch.object(cli, "ANALYSIS_PROFILE_PATH", p), \
+             mock.patch.object(cli.db, "jobs_missing_details", return_value=[]), \
+             mock.patch.object(cli.db, "pending_analysis", return_value=[]), \
+             redirect_stdout(buf):
+            cli._analysis_check()
+        text = buf.getvalue()
+        self.assertIn("2 处【】没填", text)
+        self.assertNotIn("已就绪", text)
+
+
+class TestReportWithoutChartLibrary(unittest.TestCase):
+    """统计报告的图表库是从 CDN 拉的：没网时得说清楚，不能留七块空白。"""
+
+    def setUp(self):
+        self.html = report.render(report.build_stats(
+            [make_record(platform_job_id="j1", salary_raw="10-15K"),
+             make_record(platform_job_id="j2", salary_raw="6千")]))
+
+    def test_offline_notice_exists_and_comes_first(self):
+        self.assertIn("图没画出来", self.html)
+        # 提示必须排在第一次用 echarts 之前，否则 ReferenceError 先把整个 script 打断
+        self.assertLess(self.html.find("window.echarts"), self.html.find("echarts.init"))
+
+    def test_chart_script_braces_stay_balanced(self):
+        # 这个分支是 if/else 两块，少闭合一个 } 的现场就是"页面照开、图全没了"
+        self.assertEqual(self.html.count("{"), self.html.count("}"))
 
 
 if __name__ == "__main__":

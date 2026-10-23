@@ -8,12 +8,12 @@ from playwright.sync_api import Error as PlaywrightError
 
 from .. import html_text
 from ..browser import (polite_sleep, check_daily_cap, attach, cdp_alive, open_edge,
-                       interactive_login, login_with_edge)
+                       interactive_login, login_with_edge, first_line, EDGE_HOME_URL)
 from ..config import AUTH_DIR, MAX_PAGES_DEFAULT
 
 SEARCH_URL = "https://www.zhipin.com/web/geek/jobs"
 API_SEARCH = "https://www.zhipin.com/wapi/zpgeek/search/joblist.json"
-LOGIN_URL = "https://www.zhipin.com/"
+LOGIN_URL = EDGE_HOME_URL
 # 实测：匿名访问只会拿到 __a/__c/__g/lastCity 之类，登录后才多发这两个
 LOGIN_COOKIES = {"bst", "zp_at"}
 
@@ -92,15 +92,6 @@ def _parse_item(item: dict) -> dict | None:
     }
 
 
-def _first_line(exc: BaseException) -> str:
-    """只取异常第一行。
-
-    Playwright 的报错会附一整段 Call log，里面原样带着请求头——包括 bst/zp_at 登录凭证，
-    绝不能跟着 traceback 一起打进终端。
-    """
-    return (str(exc).splitlines() or [type(exc).__name__])[0]
-
-
 class Channel:
     """一次请求一次接管：不长期持有 ctx。
 
@@ -126,7 +117,7 @@ class Channel:
                         return None
                     return resp.json()
             except (PlaywrightError, RuntimeError) as e:
-                last = _first_line(e)
+                last = first_line(e)
                 print(f"  Edge 通道中断（{last}），重新接管后重试本页。")
         raise RuntimeError(
             f"Boss 通道反复中断（{last}）。采集期间请把那个 Edge 窗口保持打开；"
@@ -147,7 +138,7 @@ class Channel:
                         return None
                     return resp.text()
             except (PlaywrightError, RuntimeError) as e:
-                last = _first_line(e)
+                last = first_line(e)
                 print(f"  Edge 通道中断（{last}），重新接管后重试这条。")
         raise RuntimeError(
             f"Boss 通道反复中断（{last}）。抓取期间请把那个 Edge 窗口保持打开。")
