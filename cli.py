@@ -61,6 +61,21 @@ def _llm_listening(url: str, timeout: float = 0.6) -> tuple[bool, str]:
         return False, f"{host}:{port}"
 
 
+def _detail_backlog():
+    """待补正文的总数，以及其中"现在补不了"的部分：{平台: (条数, 原因)}。
+
+    总数里混着登录态已过期平台的行时，"补完要 N 天"就是句假话——那批行在重新扫码
+    之前一条都抓不到。拆开说，天数只按现在真能补的算。
+    """
+    miss = db.jobs_missing_details(limit=10000, exclude_platforms=tuple(details.NO_DETAIL))
+    blocked = {}
+    for p in sorted({r["platform"] for r in miss}):
+        reason = details.block_reason(p)
+        if reason:
+            blocked[p] = (sum(1 for r in miss if r["platform"] == p), reason)
+    return len(miss), blocked
+
+
 def _analysis_check():
     """匹配度那条链的两个前置：本机自述文件 + LM Studio 端口。
 
@@ -93,16 +108,22 @@ def _analysis_check():
           f"{'有人在听' if listening else '没人听：模型没起来，analyze 会直接失败'}。")
     if not ok_profile or not listening:
         print("          这两样齐了才能算匹配度；筛选台里那一列在没跑过分析前一直是空的。")
-    missing_detail = len(db.jobs_missing_details(
-        limit=10000, exclude_platforms=tuple(details.NO_DETAIL)))
+    missing_detail, blocked = _detail_backlog()
+    reachable = missing_detail - sum(n for n, _ in blocked.values())
     pending = len(db.pending_analysis(limit=10000))
     print(f"待补正文 {missing_detail} 条（每日额度 {DETAIL_DAILY_CAP} 条），待分析 {pending} 条。")
     if details.NO_DETAIL:
         print(f"  这个数已排除正文拿不到的平台（{'、'.join(sorted(details.NO_DETAIL))}），"
               "那些行不算待补。")
-    if missing_detail > DETAIL_DAILY_CAP:
-        days = -(-missing_detail // DETAIL_DAILY_CAP)
-        print(f"  正文是分析的瓶颈：按每天 {DETAIL_DAILY_CAP} 条算，补完这 {missing_detail} 条要 {days} 天。"
+    for p, (n, reason) in blocked.items():
+        print(f"  其中 {report.PLATFORM_NAMES.get(p, p)} {n} 条现在补不了：{reason}——"
+              "重新扫码之前别拿它们估天数。")
+    if reachable > DETAIL_DAILY_CAP:
+        days = -(-reachable // DETAIL_DAILY_CAP)
+        # "现在能补的"只在真有平台被拦的时候才有意义，否则等于把同一个数说两遍
+        qual = f"现在能补的 {reachable} 条" if blocked else f"这 {reachable} 条"
+        print(f"  正文是分析的瓶颈：按每天 {DETAIL_DAILY_CAP} 条算，"
+              f"补完{qual}要 {days} 天。"
               "别等全补完，用 `detail --ids 行号` 先给要投的那几条补。")
 
 
@@ -166,12 +187,16 @@ def cmd_digest(args):
             f"{plat.get(p, p)} {n}" for p, n in
             sorted(new_today.items(), key=lambda kv: -kv[1])))
 
-    missing_detail = len(db.jobs_missing_details(
-        limit=10000, exclude_platforms=tuple(details.NO_DETAIL)))
+    missing_detail, blocked = _detail_backlog()
+    reachable = missing_detail - sum(n for n, _ in blocked.values())
     pending = len(db.pending_analysis(limit=10000))
     line = f"待补正文 {missing_detail} 条（每天 {DETAIL_DAILY_CAP} 条额度）"
-    if missing_detail > DETAIL_DAILY_CAP:
-        line += f"，补完约 {-(-missing_detail // DETAIL_DAILY_CAP)} 天"
+    for p, (n, reason) in blocked.items():
+        line += f"，{report.PLATFORM_NAMES.get(p, p)} {n} 条卡在{reason}"
+    if reachable > DETAIL_DAILY_CAP:
+        # 没有平台被拦时"能补的"就是同一个数，说两遍只会让人以为还有别的东西卡着
+        line += (f"，能补的 {reachable} 条约 {-(-reachable // DETAIL_DAILY_CAP)} 天"
+                 if blocked else f"，约 {-(-reachable // DETAIL_DAILY_CAP)} 天补完")
     print(f"{line}，待分析 {pending} 条。")
 
     scored = sorted((r for r in rows if r.get("score") is not None),
@@ -352,8 +377,20 @@ def cmd_detail(args):
         jobs = db.jobs_missing_details(platform=args.platform,
                                        limit=args.limit or DETAIL_DAILY_CAP,
                                        exclude_platforms=tuple(details.NO_DETAIL))
+    blocked = {p: r for p in sorted({j["platform"] for j in jobs})
+               if (r := details.block_reason(p))}
+    if blocked:
+        rest = [j for j in jobs if j["platform"] not in blocked]
+        for p, reason in blocked.items():
+            n = sum(1 for j in jobs if j["platform"] == p)
+            tail = "其余平台照常补。" if rest else "重新扫码之后再跑这条命令。"
+            print(f"{report.PLATFORM_NAMES.get(p, p)} 的 {n} 条这次不抓：{reason}。{tail}")
+        jobs = rest
     if not jobs:
-        print("没有需要抓正文的职位（都已经有正文了，或库里没有带详情页链接的职位）。")
+        if blocked:
+            print("这一批里没有现在能抓正文的职位，一条请求都没发。")
+        else:
+            print("没有需要抓正文的职位（都已经有正文了，或库里没有带详情页链接的职位）。")
         return
     details.collect_details(jobs, limit=args.limit, force=args.force)
 

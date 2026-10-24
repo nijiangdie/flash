@@ -27,6 +27,25 @@ def first_line(exc: BaseException) -> str:
     return (str(exc).splitlines() or [type(exc).__name__])[0]
 
 
+def _read_cookies(platform: str):
+    """登录态文件里的 cookie 列表；文件不在或读不出来返回 None。"""
+    path = AUTH_DIR / f"{platform}_storage.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8")).get("cookies") or []
+    except (OSError, ValueError):
+        return None
+
+
+def _cookie_left(c: dict):
+    """这枚 cookie 还剩几天；会话 cookie（expires 缺失/<=0）判不了，返回 None。"""
+    exp = c.get("expires")
+    if not isinstance(exp, (int, float)) or exp is None or exp <= 0:
+        return None
+    return (exp - time.time()) / 86400.0
+
+
 def login_state_report(platform: str, required=()) -> list[str]:
     """登录态体检：只看 cookie 的名字和有效期，值一律不碰。
 
@@ -38,14 +57,13 @@ def login_state_report(platform: str, required=()) -> list[str]:
         # 不需要登录的平台别对着它的（永远不存在的）登录态文件瞎操心
         lines.append("该平台不需要登录凭证，到这里就够了。")
         return lines
-    if not path.exists():
-        lines.append("还没保存过登录态。下一步：双击 login-boss.bat，"
-                     "或 python cli.py login boss --edge。")
-        return lines
-    try:
-        cookies = json.loads(path.read_text(encoding="utf-8")).get("cookies") or []
-    except (OSError, ValueError) as e:
-        lines.append(f"文件读不出来（{type(e).__name__}）：重新扫一次码覆盖它。")
+    cookies = _read_cookies(platform)
+    if cookies is None:
+        if not path.exists():
+            lines.append("还没保存过登录态。下一步：双击 login-boss.bat，"
+                         "或 python cli.py login boss --edge。")
+        else:
+            lines.append("文件读不出来：重新扫一次码覆盖它。")
         return lines
     saved = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
     lines.append(f"共 {len(cookies)} 个 cookie，这份存于 {saved}")
@@ -57,12 +75,11 @@ def login_state_report(platform: str, required=()) -> list[str]:
             absent.append(name)
             lines.append(f"  {name}: 没有（登录判据缺失）")
             continue
-        exp = c.get("expires")
-        if not isinstance(exp, (int, float)) or exp is None or exp <= 0:
+        left = _cookie_left(c)
+        if left is None:
             session_only.append(name)
             lines.append(f"  {name}: 有，但是会话 cookie（关掉浏览器就失效，有效期不判断）")
             continue
-        left = (exp - time.time()) / 86400.0
         if left < 0:
             expired.append(name)
             lines.append(f"  {name}: 已过期 {-left:.1f} 天")
@@ -80,6 +97,57 @@ def login_state_report(platform: str, required=()) -> list[str]:
     else:
         lines.append("结论：登录凭证都在且没过期。采集还是 0 条的话，看平台返回的 code 再判。")
     return lines
+
+
+def _live_state(platform: str, required):
+    """已经开着的 Edge 通道里的登录凭证状态；通道不在或接不上返回 None（=判不了）。
+
+    返回 (缺失的凭证名, 最小的剩余天数)。只读 cookie 的名字和有效期，值不落地。
+    凭证的真身在 Edge 配置目录里，`boss_storage.json` 只是份快照——没有任何命令会自动刷新它，
+    所以"重新扫过码"之后快照还能停在两周前：拿快照的日期判账号死活会假拦。
+    实时凭证是好的时候顺手把快照刷成这一份，`status` 和 login-check 也就不会再报旧日期。
+    """
+    if not cdp_alive():
+        return None
+    try:
+        with attach() as ctx:
+            by_name = {str(c.get("name")): c for c in ctx.cookies()}
+            absent = [n for n in sorted(required) if n not in by_name]
+            left = [_cookie_left(by_name[n]) for n in sorted(required) if n in by_name]
+            left = [v for v in left if v is not None]
+            worst = min(left) if left else None
+            if not absent and (worst is None or worst >= 0):
+                try:
+                    ctx.storage_state(path=str(AUTH_DIR / f"{platform}_storage.json"))
+                except Exception:
+                    pass
+            return absent, worst
+    except Exception:
+        # 通道刚被关掉 / attach 失败：判不了，别把环境问题说成账号问题
+        return None
+
+
+def login_block_reason(platform: str, required=()) -> str | None:
+    """这个平台的登录态现在能不能开工；不能就返回一句原因，能就返回 None。
+
+    只认**实时通道**里的凭证：Boss 的采集和正文都从那个 Edge 上下文现取 cookie，
+    那份快照文件里写了什么根本不影响请求能不能成。拿文件判死活的结果就是把
+    "刚扫过码的人"拦在门外，而拦住的那批一条请求都没发。
+    通道没开时返回 None（放行）：`boss.ensure_window()` 会自己把窗口弹回来，
+    `collect_details` 在弹窗之后再问一次这个函数——那时候有实测证据，拦才拦得对。
+    会话 cookie 判不了有效期，不算过期：那种情况只有真采一次才知道，别提前判死刑。
+    """
+    if not required:
+        return None
+    live = _live_state(platform, set(required))
+    if live is None:
+        return None
+    absent, worst = live
+    if absent:
+        return (f"Edge 窗口里也没有 {'、'.join(absent)}（那个浏览器现在没登录）")
+    if worst is not None and worst < 0:
+        return f"登录凭证已过期 {-worst:.1f} 天"
+    return None
 
 
 def polite_sleep():

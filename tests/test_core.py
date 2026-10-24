@@ -867,6 +867,98 @@ class TestLoginStateReport(unittest.TestCase):
                 self.assertTrue([p for p in self.RPA_BAD if p in out], f"{label}：{out}")
 
 
+class TestLoginBlockReason(unittest.TestCase):
+    """`login_block_reason`：发请求之前问一句"这个登录态还能不能开工"。
+
+    它只认**实时 Edge 通道**里的 cookie。`boss_storage.json` 只是份快照，平时没有命令会刷新它：
+    实测用户重新扫过码、通道里 bst/zp_at 还剩 7.2 天，那份快照还停在 20 多天前——
+    照快照判就把刚登录的人拦在门外，而拦掉的那批一条请求都没发。
+    所以测试必须把通道本身换掉，光 patch AUTH_DIR 会去读本机真实登录态，结果随环境变。
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.auth = Path(tmp.name)
+        self._patch = mock.patch.object(browser, "AUTH_DIR", self.auth)
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+
+    def _channel(self, cookies, alive=True):
+        """把实时通道换成假 cookie；返回那个假 context 以便断言快照有没有被刷新。
+
+        `cdp_alive` 也得造：不然本机 Edge 没开时这些用例走的是"通道没开"那条路，
+        测试结果就跟着巡检的人当天开没开浏览器变。
+        """
+        ctx = mock.MagicMock()
+        ctx.cookies.return_value = cookies
+        ctx.__enter__.return_value = ctx
+        patches = [mock.patch.object(browser, "cdp_alive",
+                                     lambda port=0, _a=alive: _a)]
+        if alive:
+            patches.append(mock.patch.object(browser, "attach", return_value=ctx))
+        else:
+            patches.append(mock.patch.object(
+                browser, "attach",
+                side_effect=AssertionError("通道没开不该 attach")))
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        return ctx
+
+    def test_expired_login_names_the_days(self):
+        now = time.time()
+        self._channel([{"name": "bst", "value": "SECRET", "expires": now - 86400 * 20},
+                       {"name": "zp_at", "value": "SECRET", "expires": now + 86400}])
+        reason = browser.login_block_reason("boss", {"bst", "zp_at"})
+        self.assertIn("已过期 20.0 天", reason)
+        self.assertNotIn("SECRET", reason)
+
+    def test_fresh_login_beats_a_stale_snapshot(self):
+        """这就是那天那个 bug：快照写着过期 20.8 天，通道里其实还剩 7 天。"""
+        now = time.time()
+        (self.auth / "boss_storage.json").write_text(json.dumps({"cookies": [
+            {"name": "bst", "value": "v", "expires": now - 86400 * 20.8},
+            {"name": "zp_at", "value": "v", "expires": now - 86400 * 20.8}]}),
+            encoding="utf-8")
+        ctx = self._channel([{"name": "bst", "value": "v", "expires": now + 86400 * 7},
+                             {"name": "zp_at", "value": "v", "expires": now + 86400 * 7}])
+        self.assertIsNone(browser.login_block_reason("boss", {"bst", "zp_at"}))
+        # 顺手把快照刷成实时那份，否则 status/login-check 会继续报旧日期
+        ctx.storage_state.assert_called_once_with(
+            path=str(self.auth / "boss_storage.json"))
+
+    def test_missing_file_is_not_a_block_when_channel_down(self):
+        """通道没开时不拦：ensure_window 会把窗口弹回来，那时才有证据可判。"""
+        self._channel([], alive=False)
+        self.assertIsNone(browser.login_block_reason("boss", {"bst", "zp_at"}))
+
+    def test_anonymous_channel_is_a_block(self):
+        self._channel([{"name": "__a", "value": "v", "expires": time.time() + 86400}])
+        self.assertIn("没登录", browser.login_block_reason("boss", {"bst", "zp_at"}))
+
+    def test_session_cookie_is_not_prejudged_dead(self):
+        """会话 cookie 判不了有效期：只有真采一次才知道，别提前判死刑把补抓全停了。"""
+        self._channel([{"name": "bst", "value": "v", "expires": -1},
+                       {"name": "zp_at", "value": "v", "expires": -1}])
+        self.assertIsNone(browser.login_block_reason("boss", {"bst", "zp_at"}))
+
+    def test_dead_channel_is_not_reported_as_dead_login(self):
+        """attach 抛错（窗口中途没了）是环境问题，不能说成"你的账号不行"。"""
+        with mock.patch.object(browser, "cdp_alive", lambda port=0: True), \
+                mock.patch.object(browser, "attach", side_effect=RuntimeError("no CDP")):
+            self.assertIsNone(browser.login_block_reason("boss", {"bst", "zp_at"}))
+
+    def test_bad_cookies_do_not_touch_the_snapshot(self):
+        """实时凭证是坏的，就别把那份坏状态写回快照——快照留给体检报告当历史。"""
+        self._channel([{"name": "__a", "value": "v", "expires": time.time()}])
+        browser.login_block_reason("boss", {"bst", "zp_at"})
+        self.assertFalse((self.auth / "boss_storage.json").exists())
+
+    def test_platform_without_login_never_blocks(self):
+        self.assertIsNone(browser.login_block_reason("zhitong", ()))
+
+
 class TestTaskLogFile(TempDbCase):
     """页面里的采集日志必须落盘：服务一重启，昨晚那次为什么 0 条就该再也查不到了。
 
@@ -922,6 +1014,118 @@ class TestTaskLogFile(TempDbCase):
         self.assertIn("完成：采到 1 条，入库新增 1 条、刷新 0 条", text)
 
 
+class TestServeLogFile(TempDbCase):
+    """服务自身的启停也要落盘：控制台重定向进文件时那份 stdout 基本是空的。
+
+    `serve` 的启动横幅走 stdout，而 stdout 一旦指向文件就变成块缓冲，进程被 taskkill 掉
+    那一行永远写不出来；访问日志又是刻意静默的。这台机器上出现过两个实例前后脚抢 8765，
+    事后只看得到一个在听、一个都不剩——所以按天的 serve 日志是唯一能回答"几点起的、
+    绑的哪个端口、令牌是不是随机"的地方。
+    """
+
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.logdir = Path(tmp.name)
+        patch = mock.patch.object(server, "LOG_DIR", self.logdir)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def _today(self):
+        p = self.logdir / f"serve-{time.strftime('%Y-%m-%d')}.log"
+        return p.read_text(encoding="utf-8") if p.exists() else ""
+
+    def _serve_until_ctrl_c(self, token_env=None):
+        """把 serve_forever 换成"立刻收到 Ctrl+C"，只跑启动和收尾两段。
+
+        返回 (日志文本, 那一次用的令牌值)：随机那路也用构造值顶掉 resolve_token，
+        这样"令牌值不能进日志"才真的被测到，而不是拿每次现编的 uuid 自证。
+        """
+        secret = token_env or "RANDOM-TOKEN-SENTINEL"
+        env = {k: v for k, v in os.environ.items() if k != server.TOKEN_ENV}
+        if token_env:
+            env[server.TOKEN_ENV] = token_env
+        httpd = mock.Mock()
+        httpd.serve_forever.side_effect = KeyboardInterrupt
+        with mock.patch.object(server, "ThreadingHTTPServer", return_value=httpd), \
+             mock.patch.object(server, "resolve_token", return_value=secret), \
+             mock.patch.dict(os.environ, env), \
+             mock.patch.multiple(server.Handler, token=None, manager=None), \
+             redirect_stdout(io.StringIO()):
+            server.serve(port=8765, open_browser=False)
+        return self._today(), secret
+
+    def test_startup_and_shutdown_record_pid_and_port(self):
+        text, _ = self._serve_until_ctrl_c()
+        self.assertIn(f"启动：监听 127.0.0.1:8765 pid {os.getpid()}", text)
+        self.assertIn(f"停止：127.0.0.1:8765 pid {os.getpid()}", text)
+
+    def test_random_token_is_described_never_written(self):
+        """记"这次是随机令牌"就够了，令牌值本身不能进日志文件。"""
+        text, secret = self._serve_until_ctrl_c()
+        self.assertIn("随机（外部程序连不上）", text)
+        self.assertNotIn(secret, text)
+
+    def test_fixed_token_is_labelled_as_fixed(self):
+        text, secret = self._serve_until_ctrl_c(token_env="SENTINEL-TOKEN-VALUE")
+        self.assertIn("令牌固定", text)
+        self.assertNotIn(secret, text)
+
+    def test_port_clash_leaves_a_trace(self):
+        """抢端口失败的那一次也得有痕迹：光看现在谁在听，猜不出刚才谁试过第二次。"""
+        with mock.patch.object(
+                server, "ThreadingHTTPServer",
+                side_effect=OSError("通常每个套接字地址只允许使用一次")), \
+             mock.patch.dict(os.environ, {server.TOKEN_ENV: "t"}), \
+             mock.patch.multiple(server.Handler, token=None, manager=None), \
+             redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                server.serve(port=8765, open_browser=False)
+        self.assertIn("启动失败：无法监听 127.0.0.1:8765", self._today())
+
+    def test_second_server_on_the_same_port_is_refused(self):
+        """Windows 上第二次 bind 同一个端口不报错，两个实例会一起听、请求随机分。
+
+        端口锁是唯一能挡住这件事的东西，所以这里要看到它真的把第二次起服务拦下来。
+        """
+        holder = server._acquire_port_lock(8765)
+        try:
+            with mock.patch.object(server, "ThreadingHTTPServer") as bind:
+                with self.assertRaises(SystemExit) as cm:
+                    server.serve(port=8765, open_browser=False)
+        finally:
+            holder.close()        # 别留到 tearDown：临时目录删不掉比断言失败更烦
+        self.assertIn("已经有一个筛选台在跑", str(cm.exception))
+        bind.assert_not_called()          # 拦在 bind 之前，不是撞了端口才发现
+        self.assertIn("启动失败：127.0.0.1:8765 已经有另一个筛选台在跑", self._today())
+
+    def test_lock_is_given_back_when_the_server_stops(self):
+        """服务退出后锁要还给系统，否则 Ctrl+C 一次就再也起不来了。"""
+        self._serve_until_ctrl_c()
+        again = server._acquire_port_lock(8765)
+        self.assertIsNotNone(again)
+        again.close()
+
+    def test_unopenable_lock_file_does_not_stop_the_server(self):
+        """锁文件所在的地方读写不了（U 盘拔了、目录被锁），也不能把服务挡在门外。"""
+        with mock.patch.object(server.db, "DB_PATH", self.logdir / "没有这个目录" / "jobs.db"):
+            self.assertIs(server._acquire_port_lock(8765), server._LOCK_SKIPPED)
+
+    def test_unwritable_log_dir_does_not_stop_the_server(self):
+        """日志位置被一个同名文件占住时服务照样得起——记不上日志是小事，起不来才是事。"""
+        blocker = self.logdir / "serve"
+        blocker.write_text("占位", encoding="utf-8")
+        httpd = mock.Mock()
+        httpd.serve_forever.side_effect = KeyboardInterrupt
+        with mock.patch.object(server, "LOG_DIR", blocker), \
+             mock.patch.object(server, "ThreadingHTTPServer", return_value=httpd), \
+             mock.patch.multiple(server.Handler, token=None, manager=None), \
+             redirect_stdout(io.StringIO()) as buf:
+            server.serve(port=8765, open_browser=False)   # 不该抛
+        self.assertIn("职位筛选台已启动", buf.getvalue())
+
+
 class TestStatusSelfCheck(unittest.TestCase):
     """status 得说清匹配度那一列为什么一直是空的：本机自述文件 + 模型端口。
 
@@ -953,7 +1157,8 @@ class TestStatusSelfCheck(unittest.TestCase):
              mock.patch.object(cli, "LLM_BASE_URL",
                                f"http://127.0.0.1:{listening_port}/v1"), \
              mock.patch.object(cli.db, "jobs_missing_details",
-                               return_value=[{} for _ in range(missing)]), \
+                               return_value=[{"platform": "zhitong"}
+                                             for _ in range(missing)]), \
              mock.patch.object(cli.db, "pending_analysis", return_value=[]), \
              redirect_stdout(buf):
             cli._analysis_check()
@@ -1032,6 +1237,18 @@ class TestDigest(TempDbCase):
             self.assertIn((datetime.now() - timedelta(days=i)).strftime("%m-%d"), text)
         # 今天一条没新增就别硬凑一行"今日分平台"
         self.assertNotIn("今日分平台", text)
+
+    def test_unreachable_login_is_named_and_left_out_of_the_day_estimate(self):
+        """待补正文里混着登录过期平台的行时，"补完约 N 天"是句假话：那批一条都抓不到。"""
+        _expired_auth(self)
+        db.save_jobs([make_record(platform="boss", platform_job_id=f"b{i}")
+                      for i in range(25)])
+        db.save_jobs([make_record(platform="zhitong", platform_job_id=f"j{i}")
+                      for i in range(25)])
+        text = self._out()
+        self.assertIn("待补正文 50 条", text)
+        self.assertIn("能补的 25 条约 2 天", text)
+        self.assertIn("Boss直聘 25 条卡在登录凭证已过期 20.0 天", text)
 
     def test_today_split_is_ordered_by_count(self):
         db.save_jobs([make_record(platform="zhitong", platform_job_id="a"),
@@ -1823,10 +2040,55 @@ class TestCollectDetails(TempDbCase):
         jobs = [det_job("b1", "boss"), det_job("b2", "boss")]
         with mock.patch.object(details, "FETCHERS", {"boss": blocked}), \
              mock.patch.object(boss, "ensure_window", return_value=None), \
+             mock.patch.object(details, "block_reason", return_value=None), \
              mock.patch.object(details, "polite_sleep"):
             with self.assertRaises(RuntimeError):
                 details.collect_details(jobs)
         self.assertEqual(calls, ["b1"])
+
+    def test_window_comes_up_but_login_is_dead(self):
+        """窗口弹回来了不等于能开工：弹窗之后再问一次实时凭证，坏的就一条都不发。
+
+        入口那次问不到（通道常常还没开，而快照文件的日期不作数），所以这一层是
+        "永不拿已知坏凭证撞平台"唯一的兜底。
+        """
+        calls = []
+
+        def fake(j):
+            calls.append(j["platform_job_id"])
+            return {"platform": j["platform"], "platform_job_id": j["platform_job_id"],
+                    "description": "d", "keyword_tags": [], "url": "u"}
+
+        jobs = [det_job("b1", "boss"), det_job("j1", "zhitong")]
+        with mock.patch.object(details, "FETCHERS", {"boss": fake, "zhitong": fake}), \
+             mock.patch.object(boss, "ensure_window", return_value=None), \
+             mock.patch.object(details, "block_reason",
+                               side_effect=lambda p: "登录凭证已过期 20.0 天"
+                               if p == "boss" else None), \
+             mock.patch.object(details, "polite_sleep") as nap, \
+             redirect_stdout(io.StringIO()) as buf:
+            res = details.collect_details(jobs)
+        self.assertEqual(calls, ["j1"])
+        self.assertIn("已过期 20.0 天", buf.getvalue())
+        self.assertEqual(res["saved"], 1)
+
+    def test_window_failure_drops_boss_but_keeps_the_rest(self):
+        """Edge 窗口起不来只该废掉 Boss 那几条：整批 raise 的话，智通那些能抓的也陪葬。"""
+        calls = []
+
+        def fake(j):
+            calls.append(j["platform_job_id"])
+            return {"platform": j["platform"], "platform_job_id": j["platform_job_id"],
+                    "description": "d", "keyword_tags": [], "url": "u"}
+
+        jobs = [det_job("b1", "boss"), det_job("j1")]
+        with mock.patch.object(details, "FETCHERS", {"zhitong": fake, "boss": fake}), \
+             mock.patch.object(boss, "ensure_window",
+                               return_value="已弹出 Edge 登录窗口，请扫码"), \
+             mock.patch.object(details, "polite_sleep"):
+            res = details.collect_details(jobs)
+        self.assertEqual(calls, ["j1"])
+        self.assertEqual(res["saved"], 1)
 
     def test_limit_caps_this_run(self):
         calls = []
@@ -1875,6 +2137,79 @@ class TestCollectDetails(TempDbCase):
         self.assertIn("滑块验证", buf.getvalue())
 
 
+def _expired_auth(case, days=20):
+    """把登录态换成"过期 N 天"——快照和实时通道两个都得造。
+
+    闸门现在只认实时通道（`boss_storage.json` 只是份快照，没有命令会自动刷新它，
+    照它判会把刚扫完码的人拦在门外），所以这里少 patch 通道的话，
+    巡检时本机 Edge 一开，测试就会读到真实登录态、结果随环境变。
+    """
+    tmp = tempfile.TemporaryDirectory()
+    case.addCleanup(tmp.cleanup)
+    auth = Path(tmp.name)
+    cookies = [{"name": "bst", "value": "v", "expires": time.time() - 86400 * days},
+               {"name": "zp_at", "value": "v", "expires": time.time() - 86400 * days}]
+    (auth / "boss_storage.json").write_text(json.dumps({"cookies": cookies}),
+                                            encoding="utf-8")
+    ctx = mock.MagicMock()
+    ctx.cookies.return_value = cookies
+    ctx.__enter__.return_value = ctx
+    for p in (mock.patch.object(browser, "AUTH_DIR", auth),
+              mock.patch.object(browser, "cdp_alive", lambda port=0: True),
+              mock.patch.object(browser, "attach", return_value=ctx)):
+        p.start()
+        case.addCleanup(p.stop)
+    return auth
+
+
+class TestDetailSkipsDeadLogin(TempDbCase):
+    """登录态过期的平台不进补抓批次。
+
+    拿过期 20 天的凭证去撞平台，比不抓更糟（风控记的是账号）；而且自动补抓是按
+    fetched_at 倒序挑的，智通行先补完就会轮到 Boss 行——那时候整批被一条死通道拖住。
+    """
+
+    def _run_detail(self, **over):
+        from types import SimpleNamespace
+        args = SimpleNamespace(platform=None, ids=None, limit=None, force=False)
+        for k, v in over.items():
+            setattr(args, k, v)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cli.cmd_detail(args)
+        return buf.getvalue()
+
+    def test_auto_batch_drops_boss_and_keeps_zhitong(self):
+        _expired_auth(self)
+        db.save_jobs([make_record(platform="boss", platform_job_id="b1"),
+                      make_record(platform="zhitong", platform_job_id="j1")])
+        calls = []
+
+        def fake(j):
+            calls.append(j["platform_job_id"])
+            return {"platform": j["platform"], "platform_job_id": j["platform_job_id"],
+                    "description": "d", "keyword_tags": [], "url": "u"}
+
+        with mock.patch.object(details, "FETCHERS", {"zhitong": fake, "boss": fake}), \
+             mock.patch.object(details, "polite_sleep"):
+            out = self._run_detail()
+        self.assertEqual(calls, ["j1"])
+        self.assertIn("过期 20.0 天", out)
+        self.assertIn("其余平台照常补", out)
+
+    def test_explicit_platform_says_rescan_and_sends_nothing(self):
+        from types import SimpleNamespace
+        _expired_auth(self)
+        db.save_jobs([make_record(platform="boss", platform_job_id="b1")])
+        with mock.patch.object(details, "collect_details",
+                               side_effect=AssertionError("不该发请求")), \
+             redirect_stdout(io.StringIO()) as buf:
+            cli.cmd_detail(SimpleNamespace(platform="boss", ids=None,
+                                           limit=None, force=False))
+        self.assertIn("重新扫码之后再跑这条命令", buf.getvalue())
+        self.assertIn("一条请求都没发", buf.getvalue())
+
+
 class TestDetailApiEndpoints(unittest.TestCase):
     def test_web_page_has_detail_column_static_does_not(self):
         web = report.render_web([make_record()], "T", "")
@@ -1915,6 +2250,18 @@ class TestDetailApiReasons(TempDbCase):
             res = post_api("/api/detail", {"id": jid})
         self.assertEqual(res["status"], 400)
         self.assertIn("滑块验证", res["obj"]["error"])
+        self.assertNotIn("已下架", res["obj"]["error"])
+
+    def test_expired_login_is_answered_without_blaming_the_job(self):
+        """登录态不行就说登录态：写成"职位已下架/要人机验证"是让他去核对一条好好的职位。"""
+        _expired_auth(self)
+        db.save_jobs([make_record(platform="boss", platform_job_id="b1")])
+        jid = db.fetch_all()[0]["id"]
+        with mock.patch.object(server.details, "collect_details",
+                               side_effect=AssertionError("不该发请求")):
+            res = post_api("/api/detail", {"id": jid})
+        self.assertEqual(res["status"], 400)
+        self.assertIn("重新扫码", res["obj"]["error"])
         self.assertNotIn("已下架", res["obj"]["error"])
 
 

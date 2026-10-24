@@ -69,6 +69,52 @@ def _append_log_file(ts: str, task: "CollectTask", line: str):
         pass        # 日志写不下去不该让采集失败
 
 
+def _append_serve_log(line: str):
+    """服务自身的启停留痕，按天一个文件：serve-YYYY-MM-DD.log。
+
+    控制台一旦重定向进文件，Python 的 stdout 就改成块缓冲，启动那几行基本不会落盘；
+    访问日志又是刻意静默的（`log_message`）。于是没有控制台的服务实例查不到"什么时候起的、
+    绑的哪个端口、跑的是不是新代码"——这台机器上出现过两个实例前后脚抢 8765，事后分不清谁是谁。
+    """
+    now = datetime.now()
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG_DIR / f"serve-{now.strftime('%Y-%m-%d')}.log", "a",
+                  encoding="utf-8") as f:
+            f.write(f"{now.strftime('%H:%M:%S')} {line}\n")
+    except OSError:
+        pass        # 同上：记不上日志不该挡住服务启停
+
+
+_LOCK_SKIPPED = object()
+
+
+def _acquire_port_lock(port: int):
+    """这个端口有没有别的筛选台占着：占着返回 None，空着返回要一直握着的句柄，开不了锁文件返回 `_LOCK_SKIPPED`。
+
+    Windows 上第二次 bind 同一个 127.0.0.1:8765 根本不报错（`HTTPServer` 带着
+    `SO_REUSEADDR`），于是两个实例能同时在听，请求落到哪一个全凭运气——本机实测过：
+    22:57 那份日志里连着两行"启动：监听 127.0.0.1:8791"，两个 pid 各自成立。
+    锁是文件句柄级的，进程一退（`taskkill` 也算）系统就收回，不留死锁。
+    """
+    path = db.DB_PATH.parent / f".serve-{port}.lock"
+    try:
+        fh = open(path, "a+")     # 只拿锁，不写内容：库里除了 jobs.db 不添别的东西
+    except OSError:
+        return _LOCK_SKIPPED      # 锁文件开不了就当没第二个实例，别把服务挡死
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    return fh
+
+
 class CollectTask:
     """单个采集任务的运行状态，供前端轮询。"""
 
@@ -319,6 +365,14 @@ class Handler(BaseHTTPRequestHandler):
         reason = details.NO_DETAIL.get(job["platform"])
         if reason:
             return self._json({"ok": False, "error": reason}, 400)
+        blocked = details.block_reason(job["platform"])
+        if blocked:
+            # 登录态过期/缺失时别发请求：拿过期凭证撞平台比不抓更糟，
+            # 而且这句话得说清是"我们的登录态不行了"，不是"这条职位没了"。
+            return self._json({"ok": False, "error":
+                               f"{report.PLATFORM_NAMES.get(job['platform'], job['platform'])}"
+                               f" 的正文这次不抓：{blocked}。"
+                               "双击 login-boss.bat 重新扫码之后，再点这个按钮。"}, 400)
         if self.manager.current_id():
             return self._json({"ok": False, "error": "采集任务正在运行，先等它结束再抓正文。"},
                               409)
@@ -426,26 +480,47 @@ def serve(port: int = DEFAULT_PORT, open_browser: bool = True, host: str = HOST)
     Handler.manager = manager
     Handler.token = token
 
+    # 先看这个端口是不是已经有一个筛选台在跑：Windows 上第二次 bind 不报错，
+    # 两个一起听会把请求随机分掉，页面上点了什么、日志落在哪一次都不确定。
+    port_lock = _acquire_port_lock(port)
+    if port_lock is None:
+        _append_serve_log(f"启动失败：{host}:{port} 已经有另一个筛选台在跑（端口锁没拿到）")
+        raise SystemExit(
+            f"{host}:{port} 上已经有一个筛选台在跑了，这次不再起第二个"
+            f"（Windows 允许两个程序同时绑同一个端口，那样请求会随机落到其中一个）。"
+            f"直接用原来那个即可，真要并排跑就换端口：python cli.py serve --port {port + 1}")
+    if port_lock is _LOCK_SKIPPED:
+        _append_serve_log(f"提示：端口锁文件开不了，{host}:{port} 跳过重复实例检查")
     try:
         httpd = ThreadingHTTPServer((host, port), Handler)
     except OSError as e:
+        if port_lock is not _LOCK_SKIPPED:
+            port_lock.close()
+        _append_serve_log(f"启动失败：无法监听 {host}:{port}（{e}）")
         raise SystemExit(
             f"无法监听 {host}:{port}（{e}）。"
-            f"多半是已有一个筛选台在运行——直接用原来那个即可，或换端口："
+            f"多半是别的程序占着这个端口——直接用原来的筛选台，或换端口："
             f"python cli.py serve --port {port + 1}")
     # 绑到 0.0.0.0 只是监听范围，不是一个能打开的地址；页面照样用回环地址访问。
     shown = "127.0.0.1" if host in ("0.0.0.0", "::") else host
     url = f"http://{shown}:{port}"
+    fixed_token = bool(os.environ.get(TOKEN_ENV, "").strip())
+    today_jobs, today_details = db.count_today(), db.count_details_today()
     print(f"职位筛选台已启动：{url}")
     if host != HOST:
         # 这个服务能触发采集、能读写本地库，离开回环地址就等于交给了整个网段。
         print(f"[注意] 监听在 {host}，同网段其它机器也能访问；"
               f"请确认 {TOKEN_ENV} 设了固定值，并用防火墙把 {port} 限到需要的网卡。")
-    if not os.environ.get(TOKEN_ENV, "").strip():
+    if not fixed_token:
         print(f"提示：没设 {TOKEN_ENV}，本次用的是随机令牌，外部程序（n8n 等）连不上。")
-    print(f"今日已入库 {db.count_today()} 条（每日额度 {DAILY_CAP} 条），"
-          f"正文已抓 {db.count_details_today()} 条（每日额度 {DETAIL_DAILY_CAP} 条）。")
+    print(f"今日已入库 {today_jobs} 条（每日额度 {DAILY_CAP} 条），"
+          f"正文已抓 {today_details} 条（每日额度 {DETAIL_DAILY_CAP} 条）。")
     print("Ctrl+C 停止服务。")
+    # 令牌只记"固定还是随机"，值本身不进日志。
+    _append_serve_log(
+        f"启动：监听 {host}:{port} pid {os.getpid()}，"
+        f"令牌{'固定' if fixed_token else '随机（外部程序连不上）'}，"
+        f"今日入库 {today_jobs}/{DAILY_CAP}，正文 {today_details}/{DETAIL_DAILY_CAP}")
     if open_browser:
         import webbrowser
         webbrowser.open(url)
@@ -455,6 +530,9 @@ def serve(port: int = DEFAULT_PORT, open_browser: bool = True, host: str = HOST)
         print("\n已停止。")
     finally:
         httpd.server_close()
+        if port_lock is not _LOCK_SKIPPED:
+            port_lock.close()
+        _append_serve_log(f"停止：{host}:{port} pid {os.getpid()}")
 
 
 if __name__ == "__main__":

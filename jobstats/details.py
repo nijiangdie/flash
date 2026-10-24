@@ -8,11 +8,13 @@
 不让页面和 CLI 把"这条通道不抓正文"说成"职位已下架"。
 """
 from . import db
-from .browser import polite_sleep
+from .browser import first_line, login_block_reason, polite_sleep
 from .collectors import boss, zhitong
 from .config import DETAIL_DAILY_CAP
 
 FETCHERS = {"boss": boss.fetch_detail, "zhitong": zhitong.fetch_detail}
+# 判"这个平台现在能不能开工"要读模块上的 LOGIN_COOKIES，所以这里留模块本身
+MODULES = {"boss": boss, "zhitong": zhitong}
 
 # 有的平台的正文根本拿不到，而原因不是"这条职位出问题了"。
 # 这句话给页面、CLI 和接口共用，免得再把能力限制说成下架或风控。
@@ -21,6 +23,19 @@ NO_DETAIL = {
              "按合规红线不绕，所以一条正文也拿不到。职位在平台上是正常的；"
              "要正文请用智通或 Boss 采到的同类岗位。",
 }
+
+
+def block_reason(platform: str) -> str | None:
+    """这个平台的正文通道现在能不能开工；不能就返回一句原因（不含 cookie 值）。
+
+    入口（cli detail / 页面接口）在发任何请求之前问一句：登录态过期或缺失时，
+    拿过期凭证去撞平台比不抓更糟（风控记的是账号），而整批里其他平台的正文
+    本来是能补的，不该陪葬。会话 cookie 判不了有效期，不算过期。
+    """
+    required = getattr(MODULES.get(platform), "LOGIN_COOKIES", None)
+    if not required:
+        return None
+    return login_block_reason(platform, set(required))
 
 
 def check_detail_cap() -> int:
@@ -69,11 +84,24 @@ def collect_details(jobs: list[dict], limit: int | None = None,
         return {"saved": 0, "failed": 0, "skipped": skipped,
                 "unreachable": unreachable}
 
-    # Boss 走真实 Edge 通道，和采集一样先把窗口准备好
+    # Boss 走真实 Edge 通道，和采集一样先把窗口准备好；窗口起不来也只剔除 Boss，
+    # 不让一条通道的故障把整批正文补抓打断。窗口准备好之后再问一次登录态：
+    # 这时候才有实测证据（入口那次问不到，因为通道常常还没开，而快照文件的日期不作数）。
     if any(j["platform"] == "boss" for j in todo):
-        hint = boss.ensure_window()
+        try:
+            hint = boss.ensure_window()
+        except Exception as e:
+            hint = f"Edge 窗口准备失败：{first_line(e)}"
+        if not hint:
+            hint = block_reason("boss")
         if hint:
-            raise RuntimeError(hint)
+            n = sum(1 for j in todo if j["platform"] == "boss")
+            print(f"  Boss 的 {n} 条这次不抓：{hint}")
+            todo = [j for j in todo if j["platform"] != "boss"]
+    if not todo:
+        print("[正文] 这一批里没有现在能抓的职位，一条请求都没发。")
+        return {"saved": 0, "failed": 0, "skipped": skipped,
+                "unreachable": unreachable}
 
     saved = failed = 0
     for n, job in enumerate(todo, 1):
