@@ -41,6 +41,16 @@ def collect_and_save(mod, query: str, city: str, pages: int):
     family = bool(getattr(mod, "FAMILY_GATE", False))
     started_at = datetime.now()
 
+    name = _platform_name(mod)
+    # 认不出来的通道（测试里的假模块）不去摸它的登录判据；排序是为了留痕里的顺序稳定
+    required = tuple(sorted(getattr(mod, "LOGIN_COOKIES", ()) or ())) if name in COLLECTORS else ()
+    if name and required:
+        # 采集用的是那个 Edge 窗口里的真凭证，快照只是给体检/status 看的缓存。
+        # 开工前顺手刷一次，免得窗口明明好用、文件却停在几周前——那正是
+        # "采集天天成功、体检说已过期 20.8 天"那个假警报的来源。
+        if browser.refresh_snapshot(name, required):
+            print(f"  [{name}] 登录快照已按实时通道刷新")
+
     def _tally(st: dict):
         for k in ("added", "refreshed", "blocked", "rules"):
             stats[k] += st.get(k, 0)

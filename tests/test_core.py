@@ -694,6 +694,35 @@ class TestEdgeChannel(unittest.TestCase):
         self.assertIn("自动恢复失败", str(cm.exception))
         self.assertNotIn("SECRET", str(cm.exception))
 
+    def test_open_edge_launches_through_a_relay_not_as_a_child(self):
+        """真窗口不能挂在启动它的那条命令的父子关系上。
+
+        实测过：直接 Popen 起的 Edge 是命令的子进程，命令被按 PID 树清场
+        （黑窗口被点掉 / RPA 任务超时被停 / 命令被打断）时端口 2 秒内就没了、
+        进程全清；中间隔一个立刻退出的进程后，同一刀杀掉父进程，端口照用。
+        这条用例钉住「隔一层」这个形状，别再退回直接子进程。
+        """
+        with mock.patch.object(browser.subprocess, "Popen") as popen, \
+             mock.patch.object(browser, "cdp_alive", lambda port=0: True), \
+             mock.patch.object(time, "sleep"):
+            browser.open_edge("https://www.zhipin.com/")
+        argv = popen.call_args[0][0]
+        self.assertEqual(argv[0], sys.executable)          # 被杀的是这个立刻退出的中转
+        self.assertNotIn("msedge", argv[0].lower())        # msedge 不再是命令的直接子进程
+        edge = argv.index(browser.edge_exe())
+        self.assertGreater(edge, 2)
+        self.assertIn("--remote-debugging-port=9223", argv[edge + 1])
+        self.assertEqual(argv[-1], "https://www.zhipin.com/")
+        self.assertEqual(popen.call_count, 1)              # 只起那一个中转，不再补刀
+
+    def test_open_edge_still_names_the_port_when_it_never_comes_up(self):
+        """隔了中转就拿不到子进程状态了，坏情况只能等满 wait——报错那句话得照旧说清端口号。"""
+        with mock.patch.object(browser.subprocess, "Popen"), \
+             mock.patch.object(browser, "cdp_alive", lambda port=0: False):
+            with self.assertRaises(RuntimeError) as cm:
+                browser.open_edge("https://www.zhipin.com/", wait=0.0)
+        self.assertIn("Edge 调试端口 9223 起不来", str(cm.exception))
+
 
 class TestLoginState(unittest.TestCase):
     """登录失败不得留下登录态文件——否则服务端会误判「已登录」，采集才静默拿到 0 条。"""
@@ -777,7 +806,12 @@ class TestAuthDirLocation(unittest.TestCase):
 
 
 class TestLoginStateReport(unittest.TestCase):
-    """`cli.py status` 的底层：只凭 cookie 名字和有效期下结论，值一个字节都不许出现在返回值里。"""
+    """`cli.py status` 的底层：只凭 cookie 名字和有效期下结论，值一个字节都不许出现在返回值里。
+
+    体检报告有两条来源：Edge 通道开着读实时那份，没开才读快照文件。默认把所有用例都钉在
+    快照那条路上（通道造成为关闭），否则本机 Edge 开没开会改变结果——影刀巡检跑的就是这段
+    输出，随机变一次就是天天误报或者永远不报。实时那条路单独用 `_channel` 造。
+    """
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -786,6 +820,29 @@ class TestLoginStateReport(unittest.TestCase):
         self._patch = mock.patch.object(browser, "AUTH_DIR", self.auth)
         self._patch.start()
         self.addCleanup(self._patch.stop)
+        self._channel_off()
+
+    def _channel_off(self):
+        off = mock.patch.object(browser, "cdp_alive", lambda port=0: False)
+        off.start()
+        self.addCleanup(off.stop)
+        boom = mock.patch.object(browser, "attach",
+                                 side_effect=AssertionError("通道没开不该 attach"))
+        boom.start()
+        self.addCleanup(boom.stop)
+
+    def _channel(self, cookies):
+        """把实时通道换成假 cookie（快照文件照旧留着，用来看有没有被刷）。"""
+        ctx = mock.MagicMock()
+        ctx.cookies.return_value = cookies
+        ctx.__enter__.return_value = ctx
+        alive = mock.patch.object(browser, "cdp_alive", lambda port=0: True)
+        alive.start()
+        self.addCleanup(alive.stop)
+        attach = mock.patch.object(browser, "attach", return_value=ctx)
+        attach.start()
+        self.addCleanup(attach.stop)
+        return ctx
 
     def _write(self, cookies):
         (self.auth / "boss_storage.json").write_text(
@@ -798,6 +855,44 @@ class TestLoginStateReport(unittest.TestCase):
         out = self._report()
         self.assertIn("还没保存过登录态", out)
         self.assertIn("login-boss.bat", out)
+
+    def test_a_never_scanned_state_still_prints_a_conclusion(self):
+        """`结论` 这句话本身也是接口：影刀分支表第 1 行只看它在不在。
+
+        从没扫过码是"该去扫码"（第 3 行），不是"巡检自己没跑成"（第 1 行）——
+        两个动作不一样：前者是双击一个 bat 扫一次码，后者是去查 .venv 和 bat 还在不在。
+        """
+        out = self._report()
+        self.assertIn("还没保存过登录态", out)
+        self.assertIn("结论", out)
+
+    def test_an_unreadable_snapshot_has_no_conclusion_on_purpose(self):
+        """反过来的那一支故意不写 `结论`：连文件都读不出来就是"判不出来"，
+        必须被第 1 行接住报"巡检没跑成"，绝不能一路掉进"以上都不命中=健康"。"""
+        (self.auth / "boss_storage.json").write_text("{这不是 JSON", encoding="utf-8")
+        out = self._report()
+        self.assertIn("文件读不出来", out)
+        self.assertNotIn("结论", out)
+
+    def test_an_unreadable_snapshot_names_the_real_reason(self):
+        """文件只是被别的程序占着，跟"这份坏了"是两件事。
+
+        原话直接让人"重新扫一次码覆盖它"——照着做的人会把一份好端端的登录态覆盖掉。
+        所以这里必须把真实原因（WinError 32 那种）带到屏幕上。
+        """
+        (self.auth / "boss_storage.json").write_text("{这不是 JSON", encoding="utf-8")
+        out = self._report()
+        self.assertIn("文件读不出来", out)
+        self.assertIn("先关掉正在占用它的程序", out)
+        self.assertIn("Expecting property name", out)
+
+    def test_a_snapshot_with_no_cookie_list_is_judged_not_crashed(self):
+        """解得开但里面没有 cookie 列表：判成"判据缺失"，而不是抛 AttributeError 把命令崩掉。"""
+        for shape in ("[]", '{"cookies": []}', '[1, "bst", null]', '" bst"'):
+            with self.subTest(shape=shape):
+                (self.auth / "boss_storage.json").write_text(shape, encoding="utf-8")
+                out = self._report()
+                self.assertIn("bst: 没有（登录判据缺失）", out)
 
     def test_expired_cookie_says_rescan_not_retry_the_command(self):
         now = time.time()
@@ -865,6 +960,86 @@ class TestLoginStateReport(unittest.TestCase):
                     self._write(cookies)
                 out = self._report()
                 self.assertTrue([p for p in self.RPA_BAD if p in out], f"{label}：{out}")
+
+    # ---- 实时通道那条路（Edge 窗口开着）----------------------------------------------
+    # 2026-10-24 那天的现场就是这条路没走：通道里 bst/zp_at 还剩 7.2 天，快照文件停在
+    # 09-26，报告照着文件报"凭证已过期 20.8 天"，影刀跟着发提醒。所以这几条是重点。
+
+    def test_closed_channel_admits_it_reads_history(self):
+        """窗口没开时读的是快照，就得在输出里写明白这话不代表"现在能不能采"。"""
+        now = time.time()
+        self._write([{"name": "bst", "value": "v", "expires": now + 86400},
+                     {"name": "zp_at", "value": "v", "expires": now + 86400}])
+        out = self._report()
+        self.assertIn("来源：快照文件", out)
+        self.assertIn("不代表现在", out)
+        self.assertIn("这份存于", out)
+
+    def test_live_channel_is_not_fooled_by_a_stale_snapshot(self):
+        """快照过期、通道好用：报实时那份，而且一个坏判据词都不许出现。"""
+        now = time.time()
+        self._write([{"name": "bst", "value": "v", "expires": now - 86400 * 20}])
+        self._channel([{"name": "bst", "value": "v", "expires": now + 86400 * 5},
+                       {"name": "zp_at", "value": "v", "expires": now + 86400 * 5}])
+        out = self._report()
+        self.assertIn("来源：实时通道", out)
+        self.assertIn("还剩 5.0 天", out)
+        for phrase in self.RPA_BAD:
+            self.assertNotIn(phrase, out)
+
+    def test_good_live_credentials_refresh_the_snapshot(self):
+        """顺手把快照刷成实时那份：文件只是缓存，没人刷它就能停四周。"""
+        now = time.time()
+        self._write([{"name": "bst", "value": "v", "expires": now - 86400 * 20}])
+        ctx = self._channel([{"name": "bst", "value": "v", "expires": now + 86400 * 5},
+                             {"name": "zp_at", "value": "v", "expires": now + 86400 * 5}])
+        out = self._report()
+        self.assertIn("已顺手刷进快照", out)
+        ctx.storage_state.assert_called_once_with(
+            path=str(self.auth / "boss_storage.json"))
+
+    def test_a_failed_snapshot_write_is_admitted(self):
+        """写文件被挡住（杀毒软件/另一个进程占着）时不许说"已刷进快照"。
+
+        2026-10-25 实测到的现场：屏幕上写着"已顺手刷进快照"，文件的 mtime 一动没动。
+        采集不受这件事影响，所以话要说成"没写进去"，既不能假装刷过，也不能报成登录坏了。
+        """
+        now = time.time()
+        ctx = self._channel([{"name": "bst", "value": "v", "expires": now + 86400 * 5},
+                             {"name": "zp_at", "value": "v", "expires": now + 86400 * 5}])
+        ctx.storage_state.side_effect = OSError("另一个程序正在使用此文件")
+        out = self._report()
+        self.assertIn("快照文件没写进去", out)
+        self.assertIn("另一个程序正在使用此文件", out)
+        self.assertNotIn("已顺手刷进快照", out)
+        for phrase in self.RPA_BAD:
+            self.assertNotIn(phrase, out)
+
+    def test_broken_live_credentials_do_not_overwrite_the_snapshot(self):
+        """实时那份是坏的就不许往文件里写：写进去等于把今天的错误变成明天的历史。"""
+        now = time.time()
+        self._write([{"name": "bst", "value": "v", "expires": now + 86400 * 9},
+                     {"name": "zp_at", "value": "v", "expires": now + 86400 * 9}])
+        before = (self.auth / "boss_storage.json").read_text(encoding="utf-8")
+        ctx = self._channel([{"name": "bst", "value": "v", "expires": now - 86400},
+                             {"name": "zp_at", "value": "v", "expires": now + 86400}])
+        out = self._report()
+        self.assertIn("凭证是坏的，没往快照里写", out)
+        ctx.storage_state.assert_not_called()
+        self.assertEqual(before, (self.auth / "boss_storage.json").read_text(encoding="utf-8"))
+
+    def test_live_anonymous_channel_still_reports_the_missing_judgement(self):
+        """通道开着但只有匿名 cookie：照样得被 `判据缺失` 逮住，且不往文件里写。"""
+        ctx = self._channel([{"name": "__a", "value": "v", "expires": time.time() + 86400}])
+        out = self._report()
+        self.assertIn("bst: 没有（登录判据缺失）", out)
+        self.assertIn("匿名访问", out)
+        ctx.storage_state.assert_not_called()
+
+    def test_live_cookie_values_never_reach_the_report(self):
+        self._channel([{"name": "bst", "value": "SECRET-BST-VALUE", "expires": time.time() + 86400},
+                       {"name": "zp_at", "value": "SECRET-ZP-VALUE", "expires": time.time() + 86400}])
+        self.assertNotIn("SECRET", self._report())
 
 
 class TestLoginBlockReason(unittest.TestCase):
@@ -959,6 +1134,207 @@ class TestLoginBlockReason(unittest.TestCase):
         self.assertIsNone(browser.login_block_reason("zhitong", ()))
 
 
+class TestRefreshSnapshot(unittest.TestCase):
+    """采集前那一下刷新：只有"通道开着且实时凭证确实能用"才动快照文件。"""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.auth = Path(tmp.name)
+        p = mock.patch.object(browser, "AUTH_DIR", self.auth)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _channel(self, cookies, alive=True):
+        ctx = mock.MagicMock()
+        ctx.cookies.return_value = cookies
+        ctx.__enter__.return_value = ctx
+        a = mock.patch.object(browser, "cdp_alive", lambda port=0, _v=alive: _v)
+        a.start()
+        self.addCleanup(a.stop)
+        t = mock.patch.object(browser, "attach",
+                              return_value=ctx if alive else
+                              mock.MagicMock(__enter__=mock.MagicMock(
+                                  side_effect=AssertionError("通道没开不该 attach"))))
+        t.start()
+        self.addCleanup(t.stop)
+        return ctx
+
+    def test_closed_channel_writes_nothing(self):
+        """窗口没开就是"不知道"，不是"坏了"：这时候一个字节都不许动。"""
+        self._channel([], alive=False)
+        self.assertFalse(browser.refresh_snapshot("boss", {"bst", "zp_at"}))
+
+    def test_usable_credentials_are_pushed_into_the_snapshot(self):
+        now = time.time()
+        ctx = self._channel([{"name": "bst", "value": "v", "expires": now + 86400 * 5},
+                             {"name": "zp_at", "value": "v", "expires": now + 86400 * 5}])
+        self.assertTrue(browser.refresh_snapshot("boss", {"bst", "zp_at"}))
+        ctx.storage_state.assert_called_once_with(
+            path=str(self.auth / "boss_storage.json"))
+
+    def test_a_blocked_write_counts_as_not_refreshed(self):
+        """刷新这件事的成功判据是"文件真的写了"，不是"凭证看着挺好"。"""
+        now = time.time()
+        ctx = self._channel([{"name": "bst", "value": "v", "expires": now + 86400 * 5},
+                             {"name": "zp_at", "value": "v", "expires": now + 86400 * 5}])
+        ctx.storage_state.side_effect = OSError("另一个程序正在使用此文件")
+        self.assertFalse(browser.refresh_snapshot("boss", {"bst", "zp_at"}))
+
+    def test_dead_credentials_stay_out_of_the_file(self):
+        now = time.time()
+        ctx = self._channel([{"name": "bst", "value": "v", "expires": now - 86400},
+                             {"name": "zp_at", "value": "v", "expires": now + 86400}])
+        self.assertFalse(browser.refresh_snapshot("boss", {"bst", "zp_at"}))
+        ctx.storage_state.assert_not_called()
+
+    def test_platform_without_login_is_left_alone(self):
+        self.assertFalse(browser.refresh_snapshot("zhitong", ()))
+
+
+class TestLoginAutoSave(unittest.TestCase):
+    """`login boss --edge` 的自动落盘：判据一凑齐就存，不用回黑窗口按回车。
+
+    原来只有按回车那一次检查会写文件，于是"登录成功却没存下快照"成了常态空档
+    ——回车按早了、或扫完码顺手关了那个窗口，凭证在浏览器里照样好用，快照能停四周。
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.auth = Path(tmp.name)
+        self.ctx = mock.MagicMock()
+        self.ctx.__enter__.return_value = self.ctx
+        self._patches = [
+            mock.patch.object(browser, "AUTH_DIR", self.auth),
+            mock.patch.object(browser, "open_edge"),
+            mock.patch.object(browser, "attach", return_value=self.ctx),
+            mock.patch("time.sleep"),
+        ]
+        for p in self._patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _cookies(self, *batches):
+        """每轮询一次交一批 cookie 名字（模拟扫码过程中凭证是陆续出现的）。"""
+        self.ctx.cookies.side_effect = [list(b) for b in batches]
+
+    def _run(self, wait=300.0, input_side_effect=None):
+        out = io.StringIO()
+        with mock.patch("builtins.input", side_effect=input_side_effect or
+                        [AssertionError("不该等人按回车")]):
+            try:
+                with redirect_stdout(out):
+                    browser.login_with_edge("boss", "https://example.com/login",
+                                            {"bst", "zp_at"}, wait=wait, poll=0.1)
+            except AssertionError as e:
+                raise AssertionError(f"走到了手动回车那条路：{e}")
+            except EOFError:
+                pass        # Ctrl+D 退出复查，等价于测试里的"到此为止"
+        return out.getvalue()
+
+    def test_completes_without_touching_enter(self):
+        now = time.time()
+        self._cookies([{"name": "__a", "value": "x", "expires": now}],
+                      [{"name": "bst", "value": "x", "expires": now + 86400 * 7},
+                       {"name": "zp_at", "value": "x", "expires": now + 86400 * 7}])
+        text = self._run()
+        self.assertIn("登录成功", text)
+        self.ctx.storage_state.assert_called_once_with(
+            path=str(self.auth / "boss_storage.json"))
+
+    def test_a_half_set_is_never_written(self):
+        """只有一笔判据时不存：半套快照写进文件后，体检报告读出来照样像"登录过"。"""
+        now = time.time()
+        self._cookies(*[[{"name": "bst", "value": "x", "expires": now + 86400 * 7}]] * 3)
+        text = self._run(wait=0.0, input_side_effect=EOFError)
+        self.ctx.storage_state.assert_not_called()
+        self.assertIn("还缺 zp_at", text)
+        self.assertIn("这一份没存", text)
+        self.assertNotIn("登录成功", text)
+
+    def test_cookie_values_never_reach_the_terminal(self):
+        """这一屏会被录进 RPA 日志、也会被贴到群里，值不能出现。"""
+        now = time.time()
+        self._cookies([{"name": "bst", "value": "SECRET-BST", "expires": now + 86400 * 7},
+                       {"name": "zp_at", "value": "SECRET-ZP", "expires": now + 86400 * 7}])
+        self.assertNotIn("SECRET", self._run())
+
+    def test_a_channel_break_falls_back_to_enter(self):
+        """轮询中途窗口没了：说清楚是通道断了，然后交给回车那条路，别静崩。"""
+        self.ctx.cookies.side_effect = RuntimeError("TargetClosedError: closed\n- Call log:")
+        text = self._run(input_side_effect=EOFError)
+        self.assertIn("通道断了", text)
+
+    def test_window_closed_before_the_first_attach(self):
+        with mock.patch.object(browser, "attach", side_effect=RuntimeError("no CDP")):
+            text = self._run(input_side_effect=EOFError)
+        self.assertIn("暂时接不上那个 Edge 窗口", text)
+
+    def test_enter_recheck_can_still_save(self):
+        """超时退回手动以后，按回车那一路照样能补齐落盘（老用法没被砍掉）。"""
+        now = time.time()
+        good = mock.MagicMock()
+        good.__enter__.return_value = good
+        good.cookies.return_value = [
+            {"name": "bst", "value": "x", "expires": now + 86400 * 7},
+            {"name": "zp_at", "value": "x", "expires": now + 86400 * 7}]
+        self.ctx.cookies.return_value = []
+        with mock.patch.object(browser, "attach", side_effect=[self.ctx, good]):
+            out = io.StringIO()
+            with mock.patch("builtins.input", return_value=""):
+                with redirect_stdout(out):
+                    browser.login_with_edge("boss", "https://example.com/login",
+                                            {"bst", "zp_at"}, wait=0.0, poll=0.1)
+        text = out.getvalue()
+        self.assertIn("登录成功", text)
+        good.storage_state.assert_called_once_with(
+            path=str(self.auth / "boss_storage.json"))
+
+
+class TestSnapshotRefreshBeforeCollect(TempDbCase):
+    """采集是拿通道里的真凭证发请求的，快照只是给体检/status 看的缓存——开工前刷一次。"""
+
+    def _fake_channel(self, name, **over):
+        fake = mock.Mock()
+        fake.PER_PAGE_SAVE = False
+        fake.SELF_GATES = False
+        fake.FAMILY_GATE = False
+        fake.collect.return_value = []
+        for k, v in over.items():
+            setattr(fake, k, v)
+        return fake
+
+    def test_the_snapshot_is_refreshed_before_the_channel_runs(self):
+        order = []
+        fake = self._fake_channel("boss", LOGIN_COOKIES={"bst", "zp_at"})
+        fake.collect.side_effect = lambda **k: order.append("collect") or []
+        with mock.patch.dict(collectors.COLLECTORS, {"boss": fake}), \
+                mock.patch.object(collectors.browser, "refresh_snapshot",
+                                  side_effect=lambda p, r: order.append(("refresh", p, r))
+                                  or True) as rs, \
+                redirect_stdout(io.StringIO()):
+            collectors.collect_and_save(fake, "IT运维", "东莞", 1)
+        rs.assert_called_once_with("boss", ("bst", "zp_at"))
+        self.assertEqual(["refresh", "collect"], [o[0] if isinstance(o, tuple) else o
+                                                  for o in order])
+
+    def test_a_channel_without_login_does_not_refresh(self):
+        fake = self._fake_channel("zhitong", LOGIN_COOKIES=set())
+        with mock.patch.dict(collectors.COLLECTORS, {"zhitong": fake}), \
+                mock.patch.object(collectors.browser, "refresh_snapshot") as rs, \
+                redirect_stdout(io.StringIO()):
+            collectors.collect_and_save(fake, "IT运维", "东莞", 1)
+        rs.assert_not_called()
+
+    def test_an_unregistered_module_is_not_mistaken_for_a_platform(self):
+        """测试里的假通道没进注册表：认不出平台名就不该去碰登录态。"""
+        with mock.patch.object(collectors.browser, "refresh_snapshot") as rs, \
+                redirect_stdout(io.StringIO()):
+            collectors.collect_and_save(self._fake_channel("x"), "IT", "东莞", 1)
+        rs.assert_not_called()
+
+
 class TestTaskLogFile(TempDbCase):
     """页面里的采集日志必须落盘：服务一重启，昨晚那次为什么 0 条就该再也查不到了。
 
@@ -974,6 +1350,11 @@ class TestTaskLogFile(TempDbCase):
         patch = mock.patch.object(server, "LOG_DIR", self.logdir)
         patch.start()
         self.addCleanup(patch.stop)
+        # 这两个用例把假模块注册成了 boss，于是 collect_and_save 会去刷登录快照。
+        # 通道一律造成为关闭：不然用例会去连本机 9223，结果跟着当天开没开 Edge 变。
+        off = mock.patch.object(browser, "cdp_alive", lambda port=0: False)
+        off.start()
+        self.addCleanup(off.stop)
 
     def _today(self):
         return self.logdir / f"collect-{time.strftime('%Y-%m-%d')}.log"
@@ -991,6 +1372,7 @@ class TestTaskLogFile(TempDbCase):
         boom = PlaywrightError("APIRequestContext.get: Request context disposed.\n"
                                "  - Cookie: bst=SECRET-BST-VALUE; zp_at=SECRET-ZP")
         fake = mock.Mock()
+        fake.LOGIN_COOKIES = {"bst", "zp_at"}   # 注册成 boss 就得给出真的判据集合
         fake.collect.side_effect = boom
         task = server.CollectTask("boss", "IT", "东莞", 1)
         with mock.patch.dict(server.COLLECTORS, {"boss": fake}):
@@ -1003,6 +1385,7 @@ class TestTaskLogFile(TempDbCase):
     def test_start_and_done_lines_are_written(self):
         fake = mock.Mock()
         fake.PER_PAGE_SAVE = False       # 老通道：整轮跑完由调用方存一次
+        fake.LOGIN_COOKIES = set()       # 智通不需要登录，采集前不该去刷快照
         fake.collect.return_value = [{"platform_job_id": "1"}]
         task = server.CollectTask("zhitong", "IT", "东莞", 2)
         with mock.patch.dict(server.COLLECTORS, {"zhitong": fake}), \
