@@ -6,8 +6,8 @@
   python cli.py serve --host 0.0.0.0         # 让 Docker 里的 n8n 也能连（配合 JOBSTATS_TOKEN）
   python cli.py login boss                   # 打开浏览器登录 Boss直聘（保存登录态）
   python cli.py login boss --edge            # 用本机真实 Edge 登录（平台拦截自动化浏览器时用）
-  python cli.py status                       # 体检：登录态还剩几天 + 今日额度用了多少
-  python cli.py digest                       # 纯文本摘要（今日新增/待补/匹配度 Top），给邮件当正文
+  python cli.py status                       # 体检：登录态还剩几天 + 今日额度 + 投出去几条、回了几条
+  python cli.py digest                       # 纯文本摘要（今日新增/待补/投递漏斗/匹配度 Top），给邮件当正文
   python cli.py collect --platform boss --query "python" --city 深圳 --pages 5
   python cli.py collect --platform job51 --query "python" --city 全国 --pages 3
   python cli.py collect --platform zhitong --query "python" --city 东莞
@@ -127,8 +127,30 @@ def _analysis_check():
               "别等全补完，用 `detail --ids 行号` 先给要投的那几条补。")
 
 
+def _funnel_check() -> None:
+    """投递漏斗：产出侧和输入侧放在同一屏上。
+
+    前面那些行数的全是"进"（额度、待补正文、待分析），而"投出去几条、回了几条"
+    原来这一屏上一个字都没有：队列永远看得见，转化从来没被打印过。2026-10-26 第一次
+    把它数出来，40 天采的 444 条里 1 条"想投"、0 条"已投"。
+    """
+    f = db.status_funnel()
+    parts = " / ".join(f"{s} {f['labels'].get(s, 0)}" for s in db.STATUS_LABELS[1:])
+    print(f"投递：{parts}，未标注 {f['unmarked']} 条（库里共 {f['total'] + f['unmarked']} 条）。")
+    if f["applied"]:
+        print(f"  投出去 {f['applied']} 条，有回音 {f['replied']} 条 = {f['rate']:.0f}%"
+              "（按最后一次改状态的时刻算，不是按投递那一刻）。")
+        w = db.status_funnel(days=7)
+        print(f"  近 7 天：投出 {w['applied']} 条、有回音 {w['replied']} 条。")
+    else:
+        print("  一条都没标「已投」及以上，回复率现在算不出来——这不是 0%，是分母还没出现。")
+    if f["undated"]:
+        print(f"  另有 {f['undated']} 条标过状态但没记时刻"
+              "（那是加这一列之前标的），按天的窗口数不到它。")
+
+
 def cmd_status(args):
-    """体检：登录态还剩几天、今日额度用了多少。不联网，也不打印任何 cookie 值。"""
+    """体检：登录态还剩几天、今日额度用了多少、投出去的有几分回了。不联网，也不打印任何 cookie 值。"""
     names = [args.platform] if args.platform else list(COLLECTORS)
     for name in names:
         required = getattr(COLLECTORS[name], "LOGIN_COOKIES", None)
@@ -142,6 +164,7 @@ def cmd_status(args):
     print(f"额度：今日已入库 {db.count_today()}/{DAILY_CAP} 条，"
           f"正文 {db.count_details_today()}/{DETAIL_DAILY_CAP} 条。")
     _analysis_check()
+    _funnel_check()
 
 
 def cmd_digest(args):
@@ -198,6 +221,15 @@ def cmd_digest(args):
         line += (f"，能补的 {reachable} 条约 {-(-reachable // DETAIL_DAILY_CAP)} 天"
                  if blocked else f"，约 {-(-reachable // DETAIL_DAILY_CAP)} 天补完")
     print(f"{line}，待分析 {pending} 条。")
+
+    # 放在匹配度之前：匹配度那一段一条分析都没有时会自己 return，
+    # 而"投出去几条"跟模型跑没跑没关系，不能跟着它一起被跳过。
+    f = db.status_funnel()
+    print("投递漏斗：" + " / ".join(f"{s}{f['labels'].get(s, 0)}"
+                                    for s in db.STATUS_LABELS[1:])
+          + f"，未标注 {f['unmarked']}"
+          + (f"；投出 {f['applied']} 条、有回音 {f['replied']} 条 = {f['rate']:.0f}%"
+             if f["applied"] else "；投出 0 条，回复率没有分母"))
 
     scored = sorted((r for r in rows if r.get("score") is not None),
                     key=lambda r: -r["score"])
@@ -433,13 +465,13 @@ def main():
     p.set_defaults(func=cmd_login)
 
     p = sub.add_parser("status",
-                       help="体检：登录态还剩几天、今日额度用了多少（不联网，不打印 cookie 值）")
+                       help="体检：登录态还剩几天、今日额度用了多少、投出去的有几分回了（不联网，不打印 cookie 值）")
     p.add_argument("platform", nargs="?", default=None, choices=list(COLLECTORS),
                    help="只看这一个平台，不给就三家都看")
     p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("digest",
-                       help="纯文本摘要（今日新增/待补正文/匹配度 Top），给邮件和外部调度当正文")
+                       help="纯文本摘要（今日新增/待补正文/投递漏斗/匹配度 Top），给邮件和外部调度当正文")
     p.add_argument("--days", type=int, default=7, help="近几天新增（默认 7，最多 30）")
     p.set_defaults(func=cmd_digest)
 

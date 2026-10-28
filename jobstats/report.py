@@ -353,6 +353,18 @@ FILTER_TEMPLATE = """<!DOCTYPE html>
   input[type=text].kw { width:240px; }
   button:hover { border-color:var(--accent); color:var(--accent); cursor:pointer; }
   button.on { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .multi { position:relative; display:inline-block; }
+  .multi > summary { list-style:none; cursor:pointer; font-size:13px; border:1px solid var(--border);
+      border-radius:6px; background:#fff; padding:5px 10px; min-width:110px; }
+  .multi > summary::-webkit-details-marker { display:none; }
+  .multi > summary::after { content:"▾"; float:right; margin-left:8px; color:var(--muted); }
+  .multi[open] > summary { border-color:var(--accent); color:var(--accent); }
+  .multi-pop { position:absolute; z-index:20; top:calc(100% + 4px); left:0; min-width:180px;
+      max-height:260px; overflow:auto; background:#fff; border:1px solid var(--border);
+      border-radius:8px; box-shadow:0 4px 16px rgba(0,0,0,.1); padding:6px 8px; }
+  .multi-pop label { display:flex; align-items:center; gap:6px; padding:3px 4px; border-radius:4px;
+      font-size:13px; cursor:pointer; white-space:nowrap; }
+  .multi-pop label:hover { background:#f2f5fb; }
   button.chip { border-radius:14px; padding:3px 12px; white-space:nowrap; }
   button.ghost { background:#fff; }
   button:disabled { opacity:.55; cursor:not-allowed; }
@@ -881,12 +893,15 @@ WEB_COLLECT_PANEL = """
 <div class="card">
   <div class="row" style="margin-bottom:0">
     <span class="grp-lbl">采集</span>
-    <select id="c-platform">
-      <option value="job51">前程无忧</option>
-      <option value="boss">Boss直聘</option>
-      <option value="zhitong">智通直聘</option>
-    </select>
-    <select id="c-city">__CITY_OPTIONS__</select>
+    <span id="c-platforms">
+      <button class="chip on" data-cplat="job51" type="button">前程无忧</button>
+      <button class="chip" data-cplat="boss" type="button">Boss直聘</button>
+      <button class="chip" data-cplat="zhitong" type="button">智通直聘</button>
+    </span>
+    <details class="multi" id="c-city-multi" title="可多选城市；「全国」和具体城市互斥">
+      <summary id="c-city-summary">全国</summary>
+      <div class="multi-pop" id="c-city-list">__CITY_OPTIONS__</div>
+    </details>
     <input type="text" id="c-kw" class="kw" placeholder="关键词，用长词（python开发）">
     <span class="hint">页数</span>
     <input type="number" id="c-pages" min="1" max="10" value="3">
@@ -916,6 +931,50 @@ function setCollecting(on){
   btn.textContent = on ? '采集中…' : '开始采集';
 }
 
+// ---- 采集范围：平台 chips 多选 + 城市复选框多选 ----
+const cCityBox = () => document.getElementById('c-city-list');
+const cPlatforms = () => [...document.querySelectorAll('#c-platforms [data-cplat].on')]
+  .map(b => b.dataset.cplat);
+const cCities = () => [...cCityBox().querySelectorAll('input[data-city]:checked')]
+  .map(x => x.dataset.city);
+
+function cPages(){
+  return Math.max(1, Math.min(10, +document.getElementById('c-pages').value || 3));
+}
+
+// 提示只报"几组"，不预测条数：一组能入库多少取决于平台当页给了什么
+function cSync(){
+  const p = cPlatforms().length, c = cCities().length;
+  const cs = cCities();
+  document.getElementById('c-city-summary').textContent =
+    cs.length === 1 ? cs[0] : (cs.length ? cs[0] + ' 等 ' + cs.length + ' 个城市' : '未选城市');
+  document.getElementById('c-hint').textContent = (p && c)
+    ? '将排队跑 ' + p + ' × ' + c + ' = ' + (p * c) + ' 组，每组最多 ' + cPages() + ' 页（顺序执行，不是并发）'
+    : '请至少选一个平台和一个城市';
+}
+
+document.querySelectorAll('#c-platforms [data-cplat]').forEach(b => {
+  b.onclick = () => {
+    // 至少留一个平台：全取消时这次点击不生效，免得按钮都不亮却还能发请求
+    if (b.classList.contains('on') && cPlatforms().length === 1) { cSync(); return; }
+    b.classList.toggle('on'); cSync();
+  };
+});
+cCityBox().addEventListener('change', e => {
+  const box = e.target.closest('input[data-city]');
+  if (!box) return;
+  const all = cCityBox().querySelector('input[data-city="全国"]');
+  if (box.checked && box.dataset.city === '全国') {
+    cCityBox().querySelectorAll('input[data-city]').forEach(x => { if (x !== box) x.checked = false; });
+  } else if (box.checked && all) {
+    all.checked = false;      // 选了具体城市就不再是"全国"
+  }
+  if (!cCities().length && all) all.checked = true;   // 一个都不剩时回到全国，不留空提交
+  cSync();
+});
+document.getElementById('c-pages').oninput = cSync;
+cSync();
+
 async function api(path, opts={}){
   opts.headers = Object.assign({'X-Token': TOKEN}, opts.headers||{});
   const res = await fetch(path, opts);
@@ -929,19 +988,21 @@ async function api(path, opts={}){
 
 document.getElementById('btn-collect').onclick = async () => {
   if (collectTimer) return;
-  const platform = document.getElementById('c-platform').value;
-  const city = document.getElementById('c-city').value;
+  const platforms = cPlatforms();
+  const cities = cCities();
   const query = document.getElementById('c-kw').value.trim();
-  const pages = Math.max(1, Math.min(10, +document.getElementById('c-pages').value || 3));
-  const pname = PNAME[platform] || platform;
-  cLog('[' + new Date().toLocaleTimeString() + '] 发起采集：' + pname + ' / ' + query + ' / ' + (city||'全国') + ' / ' + pages + ' 页');
+  const pages = cPages();
+  if (!platforms.length || !cities.length) { cLog('[提示] 请至少选一个平台和一个城市'); return; }
   if (!query) { cLog('[提示] 请先输入关键词，如 python'); return; }
+  const pname = platforms.map(p => PNAME[p] || p).join(' + ');
+  cLog('[' + new Date().toLocaleTimeString() + '] 发起采集：' + pname + ' / ' + query + ' / '
+    + cities.join('、') + ' / ' + pages + ' 页；共 ' + platforms.length * cities.length + ' 组，按顺序跑');
   setCollecting(true);
   document.getElementById('c-hint').textContent = '';
   cBox().innerHTML = ''; __logCount = 0;
   try {
     const r = await api('/api/collect', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({platform, query, city, pages})});
+      body: JSON.stringify({platforms, query, cities, pages})});
     collectTaskId = r.task.id;
     collectTimer = setInterval(pollCollect, 900);
   } catch (e) {
@@ -964,16 +1025,23 @@ async function pollCollect(){
       box.scrollTop = box.scrollHeight;
     }
     if (t.status === 'running') {
-      document.getElementById('c-hint').textContent = '采集中：已去重 ' + t.collected + ' 条 / 本批新增 ' + t.added + ' 条';
+      const total = t.runs_total || 1, done = t.runs_done || 0;
+      const cur = (t.current || '').split(' @ ');
+      const curTxt = cur.length === 2 ? '（' + (PNAME[cur[0]] || cur[0]) + ' @ ' + cur[1] + '）' : '';
+      document.getElementById('c-hint').textContent =
+        '采集中：第 ' + Math.min(done + 1, total) + '/' + total + ' 组' + curTxt
+        + '，已去重 ' + t.collected + ' 条 / 本批新增 ' + t.added + ' 条';
       return;
     }
     clearInterval(collectTimer); collectTimer = null;
     setCollecting(false);
     if (t.status === 'done') {
-      document.getElementById('c-hint').textContent = '完成：去重 ' + t.collected + ' 条，本次新增入库 ' + t.added + ' 条';
+      const failed = t.runs_failed || 0;
+      document.getElementById('c-hint').textContent = '完成：去重 ' + t.collected + ' 条，本次新增入库 '
+        + t.added + ' 条' + (failed ? '；' + failed + ' 组失败，看上面日志' : '');
       await refreshData();
     } else {
-      document.getElementById('c-hint').textContent = '采集失败';
+      document.getElementById('c-hint').textContent = '采集失败——看上面的日志';
     }
   } catch (e) {
     clearInterval(collectTimer); collectTimer = null;

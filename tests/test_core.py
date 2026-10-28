@@ -12,6 +12,7 @@ import tempfile
 import time
 import unittest
 from contextlib import contextmanager, redirect_stdout
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -462,11 +463,18 @@ class TestRenderers(unittest.TestCase):
         self.assertIn("const TOKEN = '';", static)
 
     def test_web_page_wires_token_and_city_options(self):
-        html = report.render_web([make_record()], "TOK123", '<option value="深圳">深圳</option>')
+        city_html = '<label><input type="checkbox" data-city="深圳"> 深圳</label>'
+        html = report.render_web([make_record()], "TOK123", city_html)
         self.assertIn("const TOKEN = 'TOK123';", html)
         self.assertIn('id="btn-collect"', html)
         self.assertIn("resumeTask();", html)
-        self.assertIn('<option value="深圳">深圳</option>', html)
+        self.assertIn(city_html, html)
+        # 平台/城市都是多选：平台是 chip 按钮，城市是复选框列表；旧的两个单选下拉不该再出现
+        self.assertIn('id="c-platforms"', html)
+        self.assertIn('data-cplat="zhitong"', html)
+        self.assertIn('id="c-city-list"', html)
+        self.assertNotIn('id="c-platform"', html)
+        self.assertNotIn('id="c-city"', html)
 
     def test_both_variants_share_the_filter_ui(self):
         static = report._filter_html(report.STATIC_SUB_LINE, [make_record()], web=False)
@@ -1360,7 +1368,7 @@ class TestTaskLogFile(TempDbCase):
         return self.logdir / f"collect-{time.strftime('%Y-%m-%d')}.log"
 
     def test_log_lines_reach_the_file_with_task_identity(self):
-        task = server.CollectTask("zhitong", "IT运维", "东莞", 3)
+        task = server.CollectTask(["zhitong"], "IT运维", ["东莞"], 3)
         task.log("第 1/3 页: IT运维 @ 东莞")
         text = self._today().read_text(encoding="utf-8")
         self.assertIn("[zhitong]", text)
@@ -1374,7 +1382,7 @@ class TestTaskLogFile(TempDbCase):
         fake = mock.Mock()
         fake.LOGIN_COOKIES = {"bst", "zp_at"}   # 注册成 boss 就得给出真的判据集合
         fake.collect.side_effect = boom
-        task = server.CollectTask("boss", "IT", "东莞", 1)
+        task = server.CollectTask(["boss"], "IT", ["东莞"], 1)
         with mock.patch.dict(server.COLLECTORS, {"boss": fake}):
             server.TaskManager()._run(task)
         text = self._today().read_text(encoding="utf-8")
@@ -1382,19 +1390,81 @@ class TestTaskLogFile(TempDbCase):
         self.assertNotIn("SECRET", text)
         self.assertNotIn("SECRET", task.error or "")
 
-    def test_start_and_done_lines_are_written(self):
+    def _fake(self, records=1, side_effect=None):
         fake = mock.Mock()
         fake.PER_PAGE_SAVE = False       # 老通道：整轮跑完由调用方存一次
-        fake.LOGIN_COOKIES = set()       # 智通不需要登录，采集前不该去刷快照
-        fake.collect.return_value = [{"platform_job_id": "1"}]
-        task = server.CollectTask("zhitong", "IT", "东莞", 2)
-        with mock.patch.dict(server.COLLECTORS, {"zhitong": fake}), \
+        fake.LOGIN_COOKIES = set()       # 不需要登录，采集前不该去刷快照
+        fake.collect.return_value = [{"platform_job_id": str(i)} for i in range(records)]
+        if side_effect is not None:
+            fake.collect.side_effect = side_effect
+        return fake
+
+    def test_start_and_done_lines_are_written(self):
+        task = server.CollectTask(["zhitong"], "IT", ["东莞"], 2)
+        with mock.patch.dict(server.COLLECTORS, {"zhitong": self._fake()}), \
              mock.patch.object(server.db, "init_db"), \
              mock.patch.object(server.db, "save_jobs", return_value=1):
             server.TaskManager()._run(task)
         text = self._today().read_text(encoding="utf-8")
-        self.assertIn("开始：zhitong", text)
-        self.assertIn("完成：采到 1 条，入库新增 1 条、刷新 0 条", text)
+        self.assertIn("开始：1 个平台 × 1 个城市 = 1 组", text)
+        self.assertIn("完成 1/1：智通直聘 @ 东莞，采到 1 条、入库新增 1 条、刷新 0 条", text)
+
+    def test_multiple_platforms_and_cities_run_in_order_and_aggregate(self):
+        a, b = self._fake(), self._fake()
+        task = server.CollectTask(["zhitong", "job51"], "IT", ["东莞", "深圳"], 1)
+        with mock.patch.dict(server.COLLECTORS, {"zhitong": a, "job51": b}), \
+             mock.patch.object(server.db, "init_db"), \
+             mock.patch.object(server.db, "save_jobs", return_value=1):
+            server.TaskManager()._run(task)
+        self.assertEqual(a.collect.call_count, 2)
+        self.assertEqual(b.collect.call_count, 2)
+        self.assertEqual([c.kwargs["city"] for c in a.collect.call_args_list], ["东莞", "深圳"])
+        self.assertEqual([c.kwargs["city"] for c in b.collect.call_args_list], ["东莞", "深圳"])
+        self.assertEqual((task.status, task.runs_total, task.runs_done, task.runs_failed),
+                         ("done", 4, 4, 0))
+        self.assertEqual((task.collected, task.added), (4, 4))
+        text = self._today().read_text(encoding="utf-8")
+        self.assertIn("全部完成：4 组成功，采到 4 条", text)
+        self.assertIn("[zhitong]", text)
+        self.assertIn("[job51]", text)
+
+    def test_one_platform_failing_does_not_stop_the_rest(self):
+        boom = self._fake(side_effect=RuntimeError("结构变了"))
+        ok = self._fake()
+        task = server.CollectTask(["zhitong", "job51"], "IT", ["东莞"], 1)
+        with mock.patch.dict(server.COLLECTORS, {"zhitong": boom, "job51": ok}), \
+             mock.patch.object(server.db, "init_db"), \
+             mock.patch.object(server.db, "save_jobs", return_value=1):
+            server.TaskManager()._run(task)
+        self.assertEqual(ok.collect.call_count, 1)
+        self.assertEqual((task.status, task.runs_failed), ("done", 1))
+        self.assertIn("[失败] 智通直聘 @ 东莞：结构变了", self._today().read_text(encoding="utf-8"))
+
+    def test_quota_error_stops_the_remaining_groups(self):
+        quota = self._fake(side_effect=RuntimeError(
+            "已触发每日额度熔断：今日已采集 200 条（上限 200）。"))
+        later = self._fake()
+        task = server.CollectTask(["zhitong", "job51"], "IT", ["东莞"], 1)
+        with mock.patch.dict(server.COLLECTORS, {"zhitong": quota, "job51": later}), \
+             mock.patch.object(server.db, "init_db"):
+            server.TaskManager()._run(task)
+        self.assertEqual(later.collect.call_count, 0)
+        self.assertEqual(task.status, "failed")
+        text = self._today().read_text(encoding="utf-8")
+        self.assertIn("停止：后面的 1 组不再跑", text)
+
+    def test_boss_window_failure_skips_boss_but_runs_the_rest(self):
+        ok = self._fake()
+        task = server.CollectTask(["boss", "zhitong"], "IT", ["东莞"], 1)
+        with mock.patch.dict(server.COLLECTORS, {"zhitong": ok}), \
+             mock.patch.object(server.boss, "ensure_window", return_value="Edge 窗口起不来"), \
+             mock.patch.object(server.db, "init_db"), \
+             mock.patch.object(server.db, "save_jobs", return_value=1):
+            server.TaskManager()._run(task)
+        self.assertEqual(ok.collect.call_count, 1)
+        self.assertEqual(task.status, "done")
+        text = self._today().read_text(encoding="utf-8")
+        self.assertIn("[跳过] Boss直聘：Edge 窗口起不来", text)
 
 
 class TestServeLogFile(TempDbCase):
@@ -2848,7 +2918,7 @@ class TestApplicationStatus(TempDbCase):
         db.save_jobs([make_record()])
         return db.fetch_all()[0]["id"]
 
-    def test_old_database_gets_the_two_columns(self):
+    def test_old_database_gets_the_status_columns(self):
         import sqlite3
         old = ("CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT,"
                " platform TEXT NOT NULL, platform_job_id TEXT NOT NULL, title TEXT,"
@@ -2870,6 +2940,8 @@ class TestApplicationStatus(TempDbCase):
         self.assertEqual(rows[0]["title"], "老职位")
         self.assertEqual(rows[0]["status"], "")     # 迁移前的老行读出来是空串，不是 None
         self.assertEqual(rows[0]["note"], "")
+        # status_at 不回填：这条是哪天标的没人知道，拿 fetched_at 顶上去等于给漏斗造假日期的
+        self.assertIsNone(rows[0]["status_at"])
 
     def test_status_and_note_each_only_touch_their_own_column(self):
         jid = self.one_job()
@@ -2916,6 +2988,124 @@ class TestApplicationStatus(TempDbCase):
         self.assertIn("status", head)
         self.assertIn("约面", text)
         self.assertIn('"带逗号,""和引号"""', text)
+        # 状态时刻也在导出里：Excel 里按它排序才是一份有时间线台账，只按 status 排不出先后
+        self.assertIn("status_at", head)
+        self.assertIn(db.fetch_all()[0]["status_at"][:10], text)
+
+
+class TestStatusFunnel(TempDbCase):
+    """投递漏斗：把"投出去几条、回了几条"变成一屏能被打印出来的数（2026-10-26 加的）。
+
+    第一次真数出来的是 40 天采进 444 条、1 条「想投」、0 条「已投」。所以这一节最要紧的
+    不是算出百分比，而是**零分母时别把它说成 0%**——那两句是不同的动作：
+    0% 是"投了没人理"，没有分母是"这一步压根还没发生"。
+    """
+
+    def seed(self, *labels):
+        """采 len(labels) 条（职位号 j0..），第 i 条标成 labels[i]；None 表示不标。"""
+        db.save_jobs([make_record(platform="zhitong", platform_job_id=f"j{i}")
+                      for i in range(len(labels))])
+        ids = {r["platform_job_id"]: r["id"] for r in db.fetch_all()}
+        for i, lab in enumerate(labels):
+            if lab:
+                db.set_status(ids[f"j{i}"], lab)
+        return ids
+
+    def _sql(self, script, *args):
+        import sqlite3
+        conn = sqlite3.connect(db.DB_PATH)
+        try:
+            conn.execute(script, args)
+            conn.commit()
+        finally:
+            conn.close()   # Windows 上不关掉句，tearDown 删不掉临时目录
+
+    def backdate(self, jid, day):
+        """把标注时刻挪到历史上：`status_at` 由 set_status 统一赋值，只能改库。"""
+        self._sql("UPDATE jobs SET status_at=? WHERE id=?", f"{day} 09:00:00", jid)
+
+    def _text(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cli._funnel_check()
+        return buf.getvalue()
+
+    def test_marking_a_status_stamps_the_time(self):
+        self.seed("已投")
+        stamp = db.fetch_all()[0]["status_at"]
+        self.assertEqual(stamp[:10], datetime.now().strftime("%Y-%m-%d"))
+        self.assertEqual(db.status_funnel()["applied"], 1)
+        self.assertEqual(db.status_funnel(days=7)["applied"], 1)
+        self.assertEqual(db.status_funnel(days=7)["undated"], 0)
+
+    def test_a_note_only_edit_does_not_move_the_date(self):
+        """只改备注不该把投递日期推到今天，否则"近 7 天投了几条"永远数到最后一次碎碎念。"""
+        ids = self.seed("已投")
+        self.backdate(ids["j0"], "2026-09-01")
+        db.set_status(ids["j0"], note="周三再问一下")
+        self.assertEqual(db.fetch_all()[0]["status_at"][:7], "2026-09")
+        self.assertEqual(db.status_funnel(days=7)["applied"], 0)
+        self.assertEqual(db.status_funnel()["applied"], 1)
+
+    def test_clearing_a_status_clears_its_date_too(self):
+        """标回空串 = 撤掉这条标注：留着日期会数出一条"没有状态但有日期"的行，哪头都不算。"""
+        ids = self.seed("已投")
+        db.set_status(ids["j0"], "")
+        self.assertIsNone(db.fetch_all()[0]["status_at"])
+        f = db.status_funnel()
+        self.assertEqual((f["applied"], f["total"], f["unmarked"]), (0, 0, 1))
+
+    def test_wanting_to_apply_alone_is_not_a_denominator(self):
+        """「想投」只是候选清单：两边都不算，算进分母会被没发生的投递稀释。"""
+        self.seed("想投", "想投", None)
+        f = db.status_funnel()
+        self.assertEqual((f["total"], f["applied"], f["replied"], f["rate"]),
+                         (2, 0, 0, None))
+        self.assertEqual(f["unmarked"], 1)     # 没标过的那条就是队列本身
+        text = self._text()
+        self.assertIn("想投 2", text)
+        self.assertIn("库里共 3 条", text)
+        self.assertIn("分母还没出现", text)
+        self.assertNotIn("条，有回音", text)      # 没有分母就别长出一行百分比
+
+    def test_the_rate_is_replied_over_applied(self):
+        self.seed("已投", "已投", "HR已读", "offer", "想投", "不合适")
+        f = db.status_funnel()
+        # 分母 = 已投/HR已读/约面/已面/offer = 4，分子 = HR已读/约面/已面/offer = 2
+        self.assertEqual((f["applied"], f["replied"], f["rate"]), (4, 2, 50.0))
+        text = self._text()
+        self.assertIn("投出去 4 条，有回音 2 条 = 50%", text)
+
+    def test_the_window_counts_by_the_mark_date_not_the_collect_date(self):
+        """按天窗口只看 status_at：三个月前采到的那条今天投出去，就算进这一周。"""
+        ids = self.seed("已投", "已投")
+        self.backdate(ids["j0"], (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"))
+        self.assertEqual(db.status_funnel()["applied"], 2)
+        w = db.status_funnel(days=7)
+        self.assertEqual(w["applied"], 1)
+        self.assertIn("近 7 天：投出 1 条", self._text())
+
+    def test_an_undated_mark_is_reported_instead_of_guessed(self):
+        """补列之前标的那条：按天窗口数不到它，但要把条数说出来，不能让它悄悄消失。"""
+        ids = self.seed("已投")
+        self._sql("UPDATE jobs SET status_at=NULL WHERE id=?", ids["j0"])
+        f = db.status_funnel(days=7)
+        self.assertEqual((f["applied"], f["undated"]), (0, 1))
+        self.assertIn("另有 1 条标过状态但没记时刻", self._text())
+
+    def test_the_digest_gets_one_line_even_with_no_analysis(self):
+        """匹配度那段一条分析都没有时会自己 return：投递漏斗不能跟着它一起被跳过。"""
+        from types import SimpleNamespace
+        self.seed("想投", "已投", "HR已读")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cli.cmd_digest(SimpleNamespace(days=7))
+        text = buf.getvalue()
+        self.assertIn("匹配度：还没跑过分析", text)
+        line = [ln for ln in text.splitlines() if ln.startswith("投递漏斗：")]
+        self.assertEqual(len(line), 1, text)
+        self.assertIn("想投1", line[0])
+        self.assertIn("投出 2 条、有回音 1 条 = 50%", line[0])
 
 
 class TestStatusUi(unittest.TestCase):
@@ -3082,6 +3272,53 @@ def post_api(path: str, body: dict, token: str = "T"):
     with mock.patch.object(server.Handler, "token", "T"):
         h.do_POST()
     return out
+
+
+class TestCollectApi(TempDbCase):
+    """页面上的采集范围是多选：校验放在入口，别让一个空平台/混选的城市建出任务。"""
+
+    def _post(self, body):
+        task = mock.Mock()
+        task.snapshot.return_value = {"id": "x", "runs_total": 2}
+        mgr = mock.Mock()
+        mgr.start.return_value = (task, None)
+        with mock.patch.object(server.Handler, "manager", mgr):
+            res = post_api("/api/collect", body)
+        return res, mgr
+
+    def test_rejects_empty_or_unknown_selection(self):
+        cases = [
+            ({"cities": ["东莞"], "query": "IT"}, "请至少选一个平台"),
+            ({"platforms": [], "cities": ["东莞"], "query": "IT"}, "请至少选一个平台"),
+            ({"platforms": ["zhitong"], "query": "IT"}, "请至少选一个城市"),
+            ({"platforms": ["zhitong"], "cities": ["全国", "东莞"], "query": "IT"},
+             "「全国」不能和其他城市一起选"),
+            ({"platforms": ["zhitong"], "cities": ["火星"], "query": "IT"},
+             "不支持的城市：火星"),
+            ({"platforms": ["liepin"], "cities": ["东莞"], "query": "IT"},
+             "不支持的平台：liepin"),
+            ({"platforms": ["zhitong"], "cities": ["东莞"], "query": " "},
+             "请输入搜索关键词"),
+        ]
+        for body, msg in cases:
+            with self.subTest(body=body):
+                res, mgr = self._post(body)
+                self.assertEqual(res["status"], 400)
+                self.assertEqual(res["obj"]["error"], msg)
+                mgr.start.assert_not_called()
+
+    def test_multi_selection_is_passed_through_deduped_in_order(self):
+        res, mgr = self._post({"platforms": ["zhitong", "job51", "zhitong"],
+                               "cities": ["东莞", "深圳"], "query": " IT ", "pages": 99})
+        self.assertEqual(res["status"], 200)
+        mgr.start.assert_called_once_with(["zhitong", "job51"], "IT", ["东莞", "深圳"], 10)
+        self.assertEqual(res["obj"]["task"], {"id": "x", "runs_total": 2})
+
+    def test_city_options_are_checkboxes_with_national_default(self):
+        html = server.city_options_html()
+        self.assertIn('data-city="全国" checked', html)
+        self.assertIn('data-city="东莞"', html)
+        self.assertNotIn("<option", html)
 
 
 class TestAnalysisApi(TempDbCase):
@@ -3547,6 +3784,17 @@ class TestJobDeletion(TrashCase):
         rows = db.fetch_all()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "已投")
+
+    def test_undo_keeps_the_status_date(self):
+        """删掉再撤回来，投递日期必须原样回来：漏了这列，那条从此进不了按天算的分母。"""
+        jid = seed_deletable()                    # 里面已经标了「想投」
+        stamp_before = db.fetch_all()[0]["status_at"]
+        self.assertIsNotNone(stamp_before)
+        batch = db.delete_jobs([jid])["batch"]
+        db.unblock_jobs(["zhitong:j1"])
+        db.restore_batch(batch)
+        row = db.fetch_all()[0]
+        self.assertEqual((row["status"], row["status_at"]), ("想投", stamp_before))
 
     def test_delete_blocks_future_collects(self):
         """删过的职位进屏蔽名单：第二天再采同一个关键词不会把它原样带回来。"""

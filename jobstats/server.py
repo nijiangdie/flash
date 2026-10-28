@@ -6,6 +6,7 @@
   set JOBSTATS_TOKEN=xxx && python cli.py serve --host 0.0.0.0   # 给 Docker 里的 n8n 对接用
 """
 import contextlib
+import html
 import io
 import json
 import os
@@ -41,8 +42,10 @@ def city_options() -> list[str]:
 
 
 def city_options_html() -> str:
+    """城市多选的一份复选框列表；"全国"和具体城市互斥，由页面脚本保证。"""
     return "".join(
-        f'<option value="{c}"{" selected" if c == "全国" else ""}>{c}</option>'
+        f'<label><input type="checkbox" data-city="{html.escape(c, quote=True)}"'
+        f'{" checked" if c == "全国" else ""}> {html.escape(c)}</label>'
         for c in city_options()
     )
 
@@ -64,7 +67,7 @@ def _append_log_file(ts: str, task: "CollectTask", line: str):
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         with open(LOG_DIR / f"collect-{day}.log", "a", encoding="utf-8") as f:
-            f.write(f"{ts} [{task.platform}] {task.id} {line}\n")
+            f.write(f"{ts} [{task.log_label}] {task.id} {line}\n")
     except OSError:
         pass        # 日志写不下去不该让采集失败
 
@@ -116,22 +119,37 @@ def _acquire_port_lock(port: int):
 
 
 class CollectTask:
-    """单个采集任务的运行状态，供前端轮询。"""
+    """单个采集任务的运行状态，供前端轮询。
 
-    def __init__(self, platform: str, query: str, city: str, pages: int):
+    一个任务可以带多个平台、多个城市：按"平台 × 城市"依次跑，不并发——
+    平台侧的限速是按请求算的，同时开几条通道只会让额度和凭证更难查。
+    """
+
+    def __init__(self, platforms: list[str], query: str, cities: list[str], pages: int):
         self.id = uuid.uuid4().hex[:12]
-        self.platform = platform
+        self.platforms = list(platforms)
+        self.cities = list(cities)
         self.query = query
-        self.city = city
         self.pages = pages
         self.status = "running"  # running | done | failed
         self.logs: list[tuple[str, str]] = []
         self.error = None
         self.collected = 0
         self.added = 0
+        self.runs_total = len(self.platforms) * len(self.cities)
+        self.runs_done = 0
+        self.runs_failed = 0
+        self.current = ""
         self.started_at = datetime.now().strftime("%H:%M:%S")
         self.finished_at = None
         self.lock = threading.Lock()
+
+    @property
+    def log_label(self) -> str:
+        """落盘日志行首的平台名：跑到哪组写哪组，多选时退化成连接串。"""
+        if self.current:
+            return self.current.split(" @ ", 1)[0]
+        return "+".join(self.platforms)
 
     def log(self, line: str):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -142,10 +160,12 @@ class CollectTask:
     def snapshot(self) -> dict:
         with self.lock:
             return {
-                "id": self.id, "platform": self.platform, "query": self.query,
-                "city": self.city, "pages": self.pages,
+                "id": self.id, "platforms": self.platforms, "cities": self.cities,
+                "query": self.query, "pages": self.pages,
                 "status": self.status, "error": self.error,
                 "collected": self.collected, "added": self.added,
+                "runs_total": self.runs_total, "runs_done": self.runs_done,
+                "runs_failed": self.runs_failed, "current": self.current,
                 "started_at": self.started_at, "finished_at": self.finished_at,
                 "logs": self.logs[-200:],
             }
@@ -182,11 +202,11 @@ class TaskManager:
     def get(self, tid: str) -> CollectTask | None:
         return self._tasks.get(tid)
 
-    def start(self, platform: str, query: str, city: str, pages: int):
+    def start(self, platforms: list[str], query: str, cities: list[str], pages: int):
         with self._lock:
             if self._current and self._current.status == "running":
                 return None, "已有采集任务正在运行，请先等它完成。"
-            task = CollectTask(platform, query, city, pages)
+            task = CollectTask(platforms, query, cities, pages)
             self._tasks[task.id] = task
             self._current = task
         t = threading.Thread(target=self._run, args=(task,), daemon=True)
@@ -195,34 +215,84 @@ class TaskManager:
 
     def _run(self, task: CollectTask):
         cap = _Capture(task)
-        records, stats = [], {"added": 0, "refreshed": 0, "blocked": 0,
-                              "rules": 0, "dropped": 0}
-        task.log(f"开始：{task.platform} 「{task.query}」@ {task.city}，最多 {task.pages} 页")
+        totals = dict.fromkeys(("added", "refreshed", "blocked", "rules", "dropped"), 0)
+        collected = 0
+        ok = 0
+        attempted = 0
+        first_error = None
+        pairs = [(p, c) for p in task.platforms for c in task.cities]
+        task.log(f"开始：{len(task.platforms)} 个平台 × {len(task.cities)} 个城市 = "
+                 f"{len(pairs)} 组，关键词「{task.query}」，每组最多 {task.pages} 页")
+
+        # 只有真的 Boss 通道才去摸 Edge 窗口；测试里注册的假 boss 不该弹浏览器
+        if any(p == "boss" for p, _ in pairs) and COLLECTORS.get("boss") is boss:
+            hint = boss.ensure_window()
+            if hint:
+                # 一个平台起不来不该把整批拖死：点名跳过它，其余照跑
+                pairs = [(p, c) for p, c in pairs if p != "boss"]
+                task.log(f"[跳过] Boss直聘：{hint}")
+                if not pairs:
+                    with task.lock:
+                        task.status = "failed"
+                        task.error = hint
+                        task.finished_at = datetime.now().strftime("%H:%M:%S")
+                    return
+
         try:
-            with contextlib.redirect_stdout(cap):
-                # 每页一存在 collect_and_save 里面做：中途崩了前面几页已经落库
-                records, stats = collect_and_save(COLLECTORS[task.platform],
-                                                  task.query, task.city, task.pages)
-            parts = [f"入库新增 {stats['added']} 条", f"刷新 {stats['refreshed']} 条"]
-            if stats["blocked"]:
-                parts.append(f"屏蔽名单拦掉 {stats['blocked']} 条")
-            if stats.get("rules"):
-                parts.append(f"屏蔽规则拦掉 {stats['rules']} 条")
-            if stats.get("dropped"):
-                parts.append(f"相关性闸门剔掉 {stats['dropped']} 条")
-            task.log(f"完成：采到 {len(records)} 条，" + "、".join(parts))
+            for i, (p, c) in enumerate(pairs, 1):
+                pname = report.PLATFORM_NAMES.get(p, p)
+                with task.lock:
+                    task.current = f"{p} @ {c}"
+                attempted = i
+                task.log(f"第 {i}/{len(pairs)} 组：{pname} @ {c}，最多 {task.pages} 页")
+                try:
+                    with contextlib.redirect_stdout(cap):
+                        # 每页一存在 collect_and_save 里面做：中途崩了前面几页已经落库
+                        records, stats = collect_and_save(COLLECTORS[p], task.query, c, task.pages)
+                except Exception as e:
+                    # first_line：Playwright 的 Call log 里原样带着请求头（bst/zp_at），不能整条写进日志
+                    err = browser.first_line(e)
+                    first_error = first_error or err
+                    with task.lock:
+                        task.runs_failed += 1
+                    task.log(f"[失败] {pname} @ {c}：{err}")
+                    if "每日额度熔断" in err:
+                        # 额度是全平台共用的，换一组也过不去；剩下的组直接不再发请求
+                        task.log(f"停止：后面的 {len(pairs) - i} 组不再跑（额度已到上限）。")
+                        break
+                    continue
+                collected += len(records)
+                for k in totals:
+                    totals[k] += stats[k]
+                ok += 1
+                parts = [f"采到 {len(records)} 条",
+                         f"入库新增 {stats['added']} 条", f"刷新 {stats['refreshed']} 条"]
+                if stats["blocked"]:
+                    parts.append(f"屏蔽名单拦掉 {stats['blocked']} 条")
+                if stats.get("rules"):
+                    parts.append(f"屏蔽规则拦掉 {stats['rules']} 条")
+                if stats.get("dropped"):
+                    parts.append(f"相关性闸门剔掉 {stats['dropped']} 条")
+                task.log(f"完成 {i}/{len(pairs)}：{pname} @ {c}，" + "、".join(parts))
+                with task.lock:
+                    task.collected = collected
+                    task.added = totals["added"]
+        finally:
             with task.lock:
-                task.collected = len(records)
-                task.added = stats["added"]
-                task.status = "done"
+                task.runs_done = attempted
+                task.current = ""
                 task.finished_at = datetime.now().strftime("%H:%M:%S")
-        except Exception as e:
-            # first_line：Playwright 的 Call log 里原样带着请求头（bst/zp_at），不能整条写进日志
-            task.log(f"[失败] {browser.first_line(e)}")
-            with task.lock:
-                task.status = "failed"
-                task.error = browser.first_line(e)
-                task.finished_at = datetime.now().strftime("%H:%M:%S")
+                if ok:
+                    task.status = "done"
+                else:
+                    task.status = "failed"
+                    task.error = first_error or "所有组都没跑成"
+            if ok:
+                task.log(f"全部完成：{ok} 组成功，采到 {collected} 条，"
+                         f"入库新增 {totals['added']} 条、刷新 {totals['refreshed']} 条"
+                         + (f"；{task.runs_failed} 组失败，见上面日志。" if task.runs_failed else "。"))
+            else:
+                task.log(f"[失败] {task.error}")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -324,26 +394,49 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/restore":
             return self._restore(body)
 
-        platform = body.get("platform")
+        raw_platforms = body.get("platforms")
+        if not isinstance(raw_platforms, list) or not raw_platforms:
+            return self._json({"ok": False, "error": "请至少选一个平台"}, 400)
+        platforms = list(dict.fromkeys(
+            p for p in raw_platforms if isinstance(p, str) and p))
+        if not platforms:
+            return self._json({"ok": False, "error": "请至少选一个平台"}, 400)
+        unknown = [p for p in platforms if p not in COLLECTORS]
+        if unknown:
+            return self._json({"ok": False, "error": "不支持的平台：" + "、".join(unknown)}, 400)
+
+        raw_cities = body.get("cities")
+        if not isinstance(raw_cities, list) or not raw_cities:
+            return self._json({"ok": False, "error": "请至少选一个城市"}, 400)
+        cities = list(dict.fromkeys(
+            str(c).strip() for c in raw_cities if str(c).strip()))
+        if not cities:
+            return self._json({"ok": False, "error": "请至少选一个城市"}, 400)
+        if "全国" in cities and len(cities) > 1:
+            return self._json({"ok": False,
+                               "error": "「全国」不能和其他城市一起选"}, 400)
+        known_cities = set(city_options())
+        bad_cities = [c for c in cities if c not in known_cities]
+        if bad_cities:
+            return self._json({"ok": False,
+                               "error": "不支持的城市：" + "、".join(bad_cities)}, 400)
+
         query = (body.get("query") or "").strip()
-        city = (body.get("city") or "全国").strip()
         try:
             pages = int(body.get("pages") or MAX_PAGES_DEFAULT)
         except (TypeError, ValueError):
             pages = MAX_PAGES_DEFAULT
         pages = max(1, min(10, pages))
 
-        if platform not in COLLECTORS:
-            return self._json({"ok": False, "error": "不支持的平台"}, 400)
         if not query:
             return self._json({"ok": False, "error": "请输入搜索关键词"}, 400)
-        if platform == "boss":
-            # 通道不在就先替他把 Edge 弹出来，页面上点一下就能走完，不用去命令行敲命令
+        if platforms == ["boss"]:
+            # 单选 Boss 时保持原样：窗口起不来就当场说清楚，不创建一个注定失败的任务
             hint = boss.ensure_window()
             if hint:
                 return self._json({"ok": False, "error": hint}, 400)
 
-        task, err = self.manager.start(platform, query, city, pages)
+        task, err = self.manager.start(platforms, query, cities, pages)
         if err:
             return self._json({"ok": False, "error": err}, 409)
         return self._json({"ok": True, "task": task.snapshot()})

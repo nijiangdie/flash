@@ -5,7 +5,7 @@ import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import skills
@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     url TEXT,
     fetched_at TEXT,
     status TEXT,
+    status_at TEXT,
     note TEXT,
     last_seen_at TEXT,
     UNIQUE(platform, platform_job_id)
@@ -148,9 +149,12 @@ def init_db():
         c.executescript(SCHEMA)
         # 老库补列：SQLite 的 ALTER TABLE 没有 IF NOT EXISTS，先看现有的列再补
         cols = {r["name"] for r in c.execute("PRAGMA table_info(jobs)")}
-        for col in ("status", "note"):
+        for col in ("status", "status_at", "note"):
             if col not in cols:
                 c.execute(f"ALTER TABLE jobs ADD COLUMN {col} TEXT")
+        # status_at 刻意不回填：补列之前那几条是什么时候标的没人知道，last_seen_at 是
+        # "最后一次采到"、不是"最后一次标注"，拿它顶上去等于给漏斗造一个假日期。
+        # 老行就留 NULL，下面的 status_funnel 会单独数出"改过状态但没记时刻"的条数。
         if "last_seen_at" not in cols:
             c.execute("ALTER TABLE jobs ADD COLUMN last_seen_at TEXT")
             # 补列之前的行没有"最近见到"，只能用入库时间顶上：老数据从没被重新采过，
@@ -291,15 +295,23 @@ def set_status(job_id: int, status: str | None = None, note: str | None = None) 
 
     职位被重新采集时走的是 INSERT OR IGNORE（已存在就整行跳过），所以这里写进去的
     状态和备注不会被下一次采集冲掉。
+
+    状态一变就盖 `status_at`（这是"投递漏斗"唯一的时间锚点）；只改备注不碰它，
+    否则一条写着"周三再问一下"的备注会把投递日期推到今天，按周算的回复率就假了。
+    标回空串等于撤掉这条标注，时刻也跟着清掉——留一个"没有状态但有日期"的行，
+    漏斗里既不能算进分母、又解释不了它是谁。
     """
     if status is None and note is None:
         return None
     if status is not None and status not in STATUS_LABELS:
         raise ValueError(f"不认识的投递状态: {status}")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     sets, args = [], []
     if status is not None:
         sets.append("status=?")
         args.append(status)
+        sets.append("status_at=?")
+        args.append(now if status else None)
     if note is not None:
         sets.append("note=?")
         args.append(note.strip()[:NOTE_MAX])
@@ -310,6 +322,48 @@ def set_status(job_id: int, status: str | None = None, note: str | None = None) 
         c.execute(f"UPDATE jobs SET {', '.join(sets)} WHERE id=?", args)
         row = c.execute("SELECT status, note FROM jobs WHERE id=?", (job_id,)).fetchone()
     return {"status": row["status"] or "", "note": row["note"] or ""}
+
+
+# 分母里算"已经投出去"的档位，和分子里算"有回音"的档位。
+# 「想投」只在候选清单里，一条都没发出去，所以它两边都不算：把它算进分母，
+# 回复率会被一堆根本没发生的投递稀释；「不合适」是终局，也不算回音。
+APPLIED_LABELS = ("已投", "HR已读", "约面", "已面", "offer")
+REPLIED_LABELS = ("HR已读", "约面", "已面", "offer")
+
+
+def status_funnel(days: int | None = None) -> dict:
+    """按投递状态计数，用来算"投出去多少条、有几条回了"。
+
+    `labels` 只收 7 个真状态：空串（没标过、或标回空串）走 `unmarked` 那一个数，
+    两边都收会在"库里共 N 条"里把同一条数两次。
+    `days` 给定时只看 `status_at` 落在最近这些天里的行，同时把 `undated` 数出来：
+    那几条在补 `status_at` 之前就标过状态了，谁也不知道是哪天标的，只能报数、不能猜日期。
+    `status_at` 是"最后一次改状态的时刻"，不是"投递那一刻"——从已投改成 HR已读 会覆盖掉
+    前一次，所以这里算得出比值，算不出"几天回复"。
+    """
+    where, args = "COALESCE(status, '')<>''", []
+    if days is not None:
+        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d 00:00:00")
+        where += " AND status_at >= ?"
+        args.append(cutoff)
+    out = {"labels": {}, "total": 0, "undated": 0, "unmarked": 0, "window": days}
+    with _conn() as c:
+        for label, n in c.execute(
+                f"SELECT status, COUNT(*) FROM jobs WHERE {where} GROUP BY status", args):
+            out["labels"][label] = n
+        # 这两句不带窗口条件：它们回答的是"库里还有什么没走到这一步"，
+        # 跟"最近几天投了几条"是两个问题，塞进同一个 WHERE 会数出没人看得懂的数。
+        out["undated"] = c.execute(
+            "SELECT COUNT(*) FROM jobs "
+            "WHERE COALESCE(status, '')<>'' AND status_at IS NULL").fetchone()[0]
+        out["unmarked"] = c.execute(
+            "SELECT COUNT(*) FROM jobs WHERE COALESCE(status, '')=''").fetchone()[0]
+    out["total"] = sum(out["labels"].values())
+    out["applied"] = sum(n for s, n in out["labels"].items() if s in APPLIED_LABELS)
+    out["replied"] = sum(n for s, n in out["labels"].items() if s in REPLIED_LABELS)
+    out["rate"] = (out["replied"] / out["applied"] * 100) if out["applied"] else None
+    return out
+
 
 
 def count_today() -> int:
@@ -616,11 +670,12 @@ def annual_wan(rec: dict) -> float | None:
 
 
 # 导出列：数值薪资和年薪放一起，Excel 里能直接排序，也是以后喂给 AI 的字段
-# status/note 是自己标的投递进度，导出后就是一份投递清单；正文放最后一列，免得挡住前面的
+# status/note 是自己标的投递进度，导出后就是一份投递清单；status_at 让它同时是一份时间线
+# （只有最后一次改状态的时刻，不是每一次；见 status_funnel 的说明）；正文放最后一列，免得挡住前面的
 EXPORT_FIELDS = ["platform", "platform_job_id", "title", "company", "salary_raw",
                  "salary_min", "salary_max", "salary_months", "salary_annual_wan",
                  "city", "district", "experience", "education", "industry",
-                 "company_scale", "skills", "welfare", "status", "note",
+                 "company_scale", "skills", "welfare", "status", "status_at", "note",
                  "url", "fetched_at", "description"]
 
 
@@ -654,8 +709,9 @@ BATCH_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}\.json$")
 # 撤销时逐列原样插回去。last_seen_at 必须跟着回来：INSERT_COLUMNS 是采集用的，
 # 里面没有它，撤销后就只剩 fetched_at，而页面拿 last_seen_at 判「疑似已下架」
 # （report.py 的 seenAt 会退回 fetched_at）——第一次采到在 14 天前的在职职位，
-# 撤回来就被标成下架了。
-RESTORE_JOBS = INSERT_COLUMNS + ("status", "note", "last_seen_at")
+# 撤回来就被标成下架了。status_at 同理：漏掉它，删一条再撤回来就把"投出去几天了"
+# 抹成没有日期，那条从此进不了按周算的分母。
+RESTORE_JOBS = INSERT_COLUMNS + ("status", "status_at", "note", "last_seen_at")
 
 
 def _tables(c) -> set:
