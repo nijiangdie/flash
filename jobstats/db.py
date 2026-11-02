@@ -80,6 +80,10 @@ CREATE TABLE IF NOT EXISTS blocked_rules (
     PRIMARY KEY(kind, value)
 );
 
+-- source 区分正文怎么来的：
+--   detail = 逐条打开详情页抓的，占 DETAIL_DAILY_CAP；
+--   list   = 采集列表时平台接口自带的（前程无忧），没有额外请求，不占那份额度。
+-- 没这一列的话，一次采集写进几十条正文，当天的详情补抓额度会被假占满。
 CREATE TABLE IF NOT EXISTS job_details (
     platform TEXT NOT NULL,
     platform_job_id TEXT NOT NULL,
@@ -87,6 +91,7 @@ CREATE TABLE IF NOT EXISTS job_details (
     keyword_tags TEXT,
     url TEXT,
     fetched_at TEXT,
+    source TEXT,
     PRIMARY KEY(platform, platform_job_id)
 );
 CREATE INDEX IF NOT EXISTS idx_details_fetched ON job_details(fetched_at);
@@ -165,6 +170,10 @@ def init_db():
         for col, decl in (("rules", "INTEGER"), ("drop_titles", "TEXT")):
             if run_cols and col not in run_cols:
                 c.execute(f"ALTER TABLE collect_runs ADD COLUMN {col} {decl}")
+        # 老库的正文全是逐条抓的：source 留 NULL，count_details_today 按 detail 算。
+        det_cols = {r["name"] for r in c.execute("PRAGMA table_info(job_details)")}
+        if det_cols and "source" not in det_cols:
+            c.execute("ALTER TABLE job_details ADD COLUMN source TEXT")
 
 
 # 重新采到同一条职位时，用平台新数据刷新的列。
@@ -385,10 +394,10 @@ assert set(DETAIL_COLUMNS) == ALLOWED_DETAIL_FIELDS, \
     "DETAIL_COLUMNS 与 ALLOWED_DETAIL_FIELDS 不一致"
 
 
-def save_details(records: list[dict]) -> int:
-    """写入职位正文，同一条职位重复抓则覆盖（招聘方会改 JD）。返回写入条数。"""
+def _write_details(records: list[dict], source: str) -> int:
+    """正文落库的唯一写入口；source 由调用方定，白名单照旧只认 ALLOWED_DETAIL_FIELDS。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    sql = "INSERT OR REPLACE INTO job_details({}) VALUES({})".format(
+    sql = "INSERT OR REPLACE INTO job_details({},source) VALUES({},?)".format(
         ",".join(DETAIL_COLUMNS), ",".join("?" * len(DETAIL_COLUMNS)))
     n = 0
     with _conn() as c:
@@ -401,16 +410,32 @@ def save_details(records: list[dict]) -> int:
             row = dict(r, fetched_at=now)
             row["keyword_tags"] = json.dumps(r.get("keyword_tags") or [],
                                              ensure_ascii=False)
-            n += c.execute(sql, [row.get(k) for k in DETAIL_COLUMNS]).rowcount
+            n += c.execute(sql, [row.get(k) for k in DETAIL_COLUMNS] + [source]).rowcount
     return n
 
 
+def save_details(records: list[dict]) -> int:
+    """写入逐条抓来的正文，同一条职位重复抓则覆盖（招聘方会改 JD）。返回写入条数。"""
+    return _write_details(records, "detail")
+
+
+def save_list_details(records: list[dict]) -> int:
+    """写入采集列表时平台接口自带的正文（目前只有前程无忧）。
+
+    这类正文是页面本来就收到的，没有额外发一条请求，所以不占 DETAIL_DAILY_CAP；
+    source='list' 让 count_details_today 把它排除在外，逐条补抓的额度才不会被假占满。
+    """
+    return _write_details(records, "list")
+
+
 def count_details_today() -> int:
+    """今天已经逐条抓了多少条正文——不含采集列表顺带写入的那些。"""
     today = datetime.now().strftime("%Y-%m-%d")
     with _conn() as c:
         try:
             return c.execute(
-                "SELECT COUNT(*) FROM job_details WHERE fetched_at LIKE ?",
+                "SELECT COUNT(*) FROM job_details "
+                "WHERE fetched_at LIKE ? AND COALESCE(source,'detail')<>'list'",
                 (today + "%",)).fetchone()[0]
         except sqlite3.OperationalError:  # 表尚未创建
             return 0

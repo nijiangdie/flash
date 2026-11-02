@@ -113,7 +113,7 @@ def _analysis_check():
     pending = len(db.pending_analysis(limit=10000))
     print(f"待补正文 {missing_detail} 条（每日额度 {DETAIL_DAILY_CAP} 条），待分析 {pending} 条。")
     if details.NO_DETAIL:
-        print(f"  这个数已排除正文拿不到的平台（{'、'.join(sorted(details.NO_DETAIL))}），"
+        print(f"  这个数已排除不能按条补正文的平台（{'、'.join(sorted(details.NO_DETAIL))}），"
               "那些行不算待补。")
     for p, (n, reason) in blocked.items():
         print(f"  其中 {report.PLATFORM_NAMES.get(p, p)} {n} 条现在补不了：{reason}——"

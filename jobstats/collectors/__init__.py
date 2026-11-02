@@ -70,6 +70,19 @@ def collect_and_save(mod, query: str, city: str, pages: int):
             relevance.merge(dropped, detail)
             batch = kept
         if batch:
+            # 列表页顺带拿到的正文（前程无忧的搜索接口自带）：摘出来单独写 job_details。
+            # 不能留在记录里：jobs 表白名单会直接拒收这个键。这类正文没有额外发请求，
+            # 由 db.save_list_details 标成来源 list，不占 DETAIL_DAILY_CAP 的逐条额度。
+            jd = []
+            for r in batch:
+                desc = (r.pop("_description", "") or "").strip()
+                if desc:
+                    jd.append({"platform": r["platform"],
+                               "platform_job_id": r["platform_job_id"],
+                               "description": desc, "keyword_tags": [],
+                               "url": r.get("url") or ""})
+            if jd:
+                db.save_list_details(jd)
             _tally(db.save_stats(batch))
 
     per_page = getattr(mod, "PER_PAGE_SAVE", False)

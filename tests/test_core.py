@@ -32,7 +32,8 @@ SLOT_NAMES = ("__SUB_LINE__", "__GENERATED_AT__", "__N__", "__DATA__", "__TOKEN_
               "__DETAIL_SCRIPT__", "__DETAIL_TH__", "__IS_WEB__",
               "__STATUS_SCRIPT__", "__STATUS_CONSTS__", "__STALE_DAYS__", "__NO_DETAIL__",
               "__NO_LIST_SKILLS__",
-              "__DELETE_TH__", "__DELETE_BAR__", "__DELETE_SCRIPT__")
+              "__DELETE_TH__", "__DELETE_BAR__", "__DELETE_SCRIPT__",
+              "__TRIAGE_BUTTON__", "__TRIAGE_PANEL__", "__TRIAGE_SCRIPT__")
 
 
 def make_record(**over):
@@ -475,6 +476,27 @@ class TestRenderers(unittest.TestCase):
         self.assertIn('id="c-city-list"', html)
         self.assertNotIn('id="c-platform"', html)
         self.assertNotIn('id="c-city"', html)
+
+    def test_triage_prototype_is_web_only(self):
+        """「过一遍」要写 /api/status，静态页没有服务端可写，整块都不该出现。"""
+        web = report.render_web([make_record()], "T", "")
+        static = report._filter_html(report.STATIC_SUB_LINE, [make_record()], web=False)
+        self.assertIn('id="btn-triage"', web)
+        self.assertIn('id="triage-body"', web)
+        self.assertIn("data-tri=\"想投\"", web)
+        self.assertIn("triagePool()", web)
+        for marker in ('id="btn-triage"', 'id="triage"', "startTriage("):
+            self.assertNotIn(marker, static)
+
+    def test_triage_only_offers_unmarked_jobs_and_reuses_status_api(self):
+        """候选只收未标注的行；标记动作必须走现有的 /api/status，不另造一套写库口。"""
+        web = report.render_web([make_record()], "T", "")
+        js = report.TRIAGE_JS
+        self.assertIn("!(r.status || '')", js)
+        self.assertIn("api('/api/status'", js)
+        self.assertIn("TRI.seen", js)
+        # 静态页的匹配度/正文用的是同一份脚本，别让 triage 的按钮绑到空元素上
+        self.assertIn('id="triage-close"', web)
 
     def test_both_variants_share_the_filter_ui(self):
         static = report._filter_html(report.STATIC_SUB_LINE, [make_record()], web=False)
@@ -1953,6 +1975,38 @@ class TestZhitongParse(unittest.TestCase):
         self.assertNotIn("city=", self.mod._search_url("IT", "全国", 1))
 
 
+class TestJob51SearchApi(unittest.TestCase):
+    """前程无忧的正文取自平台自己的搜索响应：不额外发请求，也不碰详情页的 WAF。"""
+
+    @staticmethod
+    def _resp(payload, status=200):
+        r = mock.Mock()
+        r.status = status
+        r.json.return_value = payload
+        return r
+
+    def test_maps_job_id_to_describe_and_href(self):
+        from jobstats.collectors import job51
+        payload = {"resultbody": {"job": {"items": [
+            {"jobId": 11, "jobDescribe": " 岗位职责 ",
+             "jobHref": "https://jobs.51job.com/a/11.html?req=x"},
+            {"jobId": "12", "jobDescribe": "",
+             "jobHref": "https://jobs.51job.com/a/12.html"},
+        ]}}}
+        got = job51._search_api_jobs([self._resp(payload)])
+        self.assertEqual(set(got), {"11", "12"})
+        self.assertEqual(got["11"]["jobDescribe"].strip(), "岗位职责")
+        # 调用方会把追踪参数切掉，这里只保证原始 jobHref 拿到了
+        self.assertIn("jobs.51job.com/a/11.html", got["11"]["jobHref"])
+
+    def test_error_or_unreadable_response_is_ignored(self):
+        from jobstats.collectors import job51
+        broken = mock.Mock(status=200)
+        broken.json.side_effect = ValueError("bad json")
+        self.assertEqual(job51._search_api_jobs(
+            [self._resp({}, status=500), broken, self._resp({"resultbody": None})]), {})
+
+
 class TestCollectAndSave(TempDbCase):
     """collect_and_save：支持每页一存的通道边采边存，不支持的照旧整轮存一次。"""
 
@@ -2030,6 +2084,17 @@ class TestCollectAndSave(TempDbCase):
         self.assertEqual(st["dropped"], 2)
         self.assertEqual(st["added"], 1)
         self.assertEqual([r["platform_job_id"] for r in db.fetch_all()], ["j4"])
+
+    def test_list_page_description_goes_to_details_not_jobs(self):
+        """前程无忧搜索接口自带的正文随每页写入 job_details：
+        jobs 表的白名单不收这个键，而且它不占逐条抓正文的额度。"""
+        rec = make_record(platform_job_id="g1", _description="岗位职责\n1、维护 ERP")
+        mod = self._pages_mod([[rec]])
+        records, st = collectors.collect_and_save(mod, "IT", "东莞", 1)
+        self.assertEqual(st["added"], 1)
+        self.assertNotIn("_description", records[0])
+        self.assertEqual(db.get_detail("job51", "g1")["description"], "岗位职责\n1、维护 ERP")
+        self.assertEqual(db.count_details_today(), 0)
 
     def test_channel_that_self_gates_is_not_judged_twice(self):
         """自己声明 SELF_GATES 的通道，公共落库口不能再判一遍——
@@ -2418,6 +2483,19 @@ class TestDetailStore(TempDbCase):
         self.assertEqual(db.detail_keys(), ["zhitong:j1"])
         self.assertEqual(db.count_details_today(), 1)
 
+    def test_list_sourced_body_does_not_eat_the_detail_quota(self):
+        """采集顺带写进来的正文没有额外发请求，不该把今天的逐条补抓额度假占满。"""
+        self.make_job("g1", platform="job51")
+        self.make_job("j1")
+        db.save_list_details([{"platform": "job51", "platform_job_id": "g1",
+                               "description": "x", "keyword_tags": [], "url": "u"}])
+        self.assertEqual(db.get_detail("job51", "g1")["description"], "x")
+        self.assertIn("job51:g1", db.detail_keys())
+        self.assertEqual(db.count_details_today(), 0)
+        db.save_details([{"platform": "zhitong", "platform_job_id": "j1",
+                          "description": "y", "keyword_tags": [], "url": "u"}])
+        self.assertEqual(db.count_details_today(), 1)
+
     def test_missing_listing_can_drop_channels_without_details(self):
         """前程无忧的行有详情页链接却永远补不上正文：留在候选里就是虚高的待补数。"""
         self.make_job("j1")
@@ -2679,6 +2757,14 @@ class TestDetailApiEndpoints(unittest.TestCase):
         js = report.DETAIL_JS
         self.assertIn("pre.textContent = d.description", js)
         self.assertNotIn("innerHTML = d.description", js)
+
+    def test_stored_body_wins_over_the_channel_limitation(self):
+        """前程无忧的正文现在随采集写入：有正文的行要显示"看正文"，
+        不能因为平台不支持按条补抓就一律写成"不抓正文"。"""
+        js = report.FILTER_TEMPLATE
+        self.assertIn("const hasDet = DET.has(detKey(r));", js)
+        self.assertIn("const nd = hasDet ? '' : (NO_DETAIL[r.platform] || '');", js)
+        self.assertIn("hasDet ? '看正文'", js)
 
     def test_no_detail_map_reaches_the_page_and_leaves_no_placeholder(self):
         nd = {"job51": "前程无忧这条通道不抓正文"}

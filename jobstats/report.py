@@ -365,6 +365,29 @@ FILTER_TEMPLATE = """<!DOCTYPE html>
   .multi-pop label { display:flex; align-items:center; gap:6px; padding:3px 4px; border-radius:4px;
       font-size:13px; cursor:pointer; white-space:nowrap; }
   .multi-pop label:hover { background:#f2f5fb; }
+  .triage { position:fixed; inset:0; z-index:60; display:flex; align-items:flex-start;
+      justify-content:center; padding:40px 16px; overflow:auto; background:rgba(31,35,41,.45); }
+  .triage[hidden] { display:none; }
+  .triage-box { width:min(720px,100%); background:#fff; border-radius:12px; padding:18px 20px;
+      box-shadow:0 8px 32px rgba(0,0,0,.18); }
+  .triage-head { display:flex; align-items:center; justify-content:space-between;
+      gap:12px; margin-bottom:10px; }
+  .triage-card h2 { font-size:20px; line-height:1.35; margin:6px 0 8px; }
+  .triage-card h2 a { color:var(--text); text-decoration:none; }
+  .triage-card h2 a:hover { color:var(--accent); }
+  .triage-meta { color:var(--muted); font-size:13px; line-height:1.9; }
+  .triage-salary { color:var(--accent); font-weight:600; }
+  .triage-actions { display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin-top:16px; }
+  .triage-actions button, a.triage-open { font-size:13px; padding:7px 16px; border-radius:6px;
+      border:1px solid var(--border); background:#fff; color:var(--text); text-decoration:none; }
+  .triage-actions button.want { background:#00b578; border-color:#00b578; color:#fff; }
+  .triage-actions button.want:hover { background:#009e6a; color:#fff; }
+  .triage-actions button.no:hover { border-color:#d83b01; color:#d83b01; }
+  a.triage-open { margin-left:auto; }
+  a.triage-open:hover { border-color:var(--accent); color:var(--accent); }
+  .triage-keys { color:var(--muted); font-size:12px; margin-top:10px; }
+  .triage-empty { padding:22px 0; text-align:center; color:var(--muted); line-height:1.9; }
+  .triage-empty p { color:var(--text); }
   button.chip { border-radius:14px; padding:3px 12px; white-space:nowrap; }
   button.ghost { background:#fff; }
   button:disabled { opacity:.55; cursor:not-allowed; }
@@ -481,6 +504,7 @@ __COLLECT_PANEL__
     </select>
     <button class="ghost" id="btn-reset">重置筛选</button>
     <button class="ghost" id="btn-export">导出当前结果 CSV</button>
+__TRIAGE_BUTTON__
     <span class="hint" id="filter-hint"></span>
   </div>
 __DELETE_BAR__
@@ -505,6 +529,7 @@ __DELETE_BAR__
     <button class="ghost" id="pg-next">下一页</button>
   </div>
 </div>
+__TRIAGE_PANEL__
 
 <script>
 let DATA = __DATA__;
@@ -815,10 +840,13 @@ function renderTable(){
             + `——这个平台的列表页没有技能标签那一列（悬停看详细说明）">来自详情页</span></div>` : ''}`
         + `</td>`
       : `<td>${nl ? `<span class="hint" title="${esc(nl)}">没采到技能</span>` : '—'}</td>`;
-    const nd = NO_DETAIL[r.platform] || '';
+    // 已经随列表采到正文的行（前程无忧）先按"有正文"显示：平台不能按条补，
+    // 不等于这条没有正文。只有库里真没有时才退回"不抓正文"。
+    const hasDet = DET.has(detKey(r));
+    const nd = hasDet ? '' : (NO_DETAIL[r.platform] || '');
     const det = WEB ? `<td><button class="chip" data-det="1" data-id="${esc(r.id)}"
       data-key="${esc(detKey(r))}"${nd ? ` data-nd="${esc(nd)}" title="${esc(nd)}"` : ''}>`
-      + `${nd ? '不抓正文' : (DET.has(detKey(r)) ? '看正文' : '抓正文')}</button></td>` : '';
+      + `${hasDet ? '看正文' : (nd ? '不抓正文' : '抓正文')}</button></td>` : '';
     const stCell = WEB ? `<td>
       <select class="st" data-st="${esc(r.id)}">${STATUS.map(s =>
         `<option value="${esc(s)}"${(r.status||'')===s?' selected':''}>${esc(s||'未标注')}</option>`
@@ -880,7 +908,7 @@ function exportCSV(){
   a.click();
 }
 
-__COLLECT_SCRIPT____DETAIL_SCRIPT____STATUS_SCRIPT____DELETE_SCRIPT__buildUI();
+__COLLECT_SCRIPT____DETAIL_SCRIPT____STATUS_SCRIPT____DELETE_SCRIPT____TRIAGE_SCRIPT__buildUI();
 apply();__BOOT_HOOK__
 </script>
 </body>
@@ -1218,14 +1246,15 @@ function renderXref(id){
     item.className = 'xref-item';
     const u = safeUrl(x.url);
     const key = x.platform + ':' + x.platform_job_id;
-    const nd = NO_DETAIL[x.platform] || '';
+    const has = x.has_detail || DET.has(key);
+    const nd = has ? '' : (NO_DETAIL[x.platform] || '');
     item.innerHTML = `<span class="plat-badge p-${esc(x.platform)}">${esc(PNAME[x.platform]||x.platform)}</span>`
       + `<span>${u ? `<a href="${esc(u)}" target="_blank" rel="noopener">在原页看</a>` : '（没留链接）'}</span>`
       + `<span>薪资 ${esc(x.salary_raw||'—')}</span><span>${esc(x.city||'没写城市')}</span>`
       + `<span class="hint">最近见到 ${esc(x.seen||'—')}</span>`
       + (nd ? `<span class="hint">${esc(nd)}</span>`
             : `<button class="chip" data-xdet="1" data-id="${esc(x.id)}" data-key="${esc(key)}">`
-              + `${(x.has_detail || DET.has(key)) ? '看正文' : '抓正文'}</button>`)
+              + `${has ? '看正文' : '抓正文'}</button>`)
       + `<div class="xref-det"></div>`;
     box.appendChild(item);
   });
@@ -1337,11 +1366,140 @@ async function loadTrash(){
 
 """
 
+TRIAGE_BUTTON = ('<button class="ghost" id="btn-triage"'
+                 ' title="一次只看 10 条：想投 / 不合适 / 跳过，键盘 1/2/3">过一遍 10 条</button>')
+
+TRIAGE_PANEL = """<div class="triage" id="triage" hidden>
+  <div class="triage-box" role="dialog" aria-modal="true" aria-labelledby="triage-title">
+    <div class="triage-head">
+      <span class="hint" id="triage-progress"></span>
+      <button class="ghost" id="triage-close" title="退出（Esc）">退出</button>
+    </div>
+    <div id="triage-body"></div>
+  </div>
+</div>"""
+
+TRIAGE_JS = r"""// ---- 原型：过一遍 10 条（只看还没标的，键盘 1/2/3） ----
+const TRI = {ids: [], i: 0, want: 0, no: 0, skip: 0, seen: new Set(), open: false};
+let triBusy = false;
+
+function triagePool(){
+  return DATA.filter(r => !(r.status || '') && !TRI.seen.has(String(r.id)))
+    .sort((a, b) => String(b.fetched_at).localeCompare(String(a.fetched_at)));
+}
+
+function startTriage(limit){
+  TRI.ids = triagePool().slice(0, limit || 10).map(r => String(r.id));
+  TRI.i = 0; TRI.want = TRI.no = TRI.skip = 0; TRI.open = true; triBusy = false;
+  document.getElementById('triage').hidden = false;
+  document.body.style.overflow = 'hidden';
+  triageRender();
+}
+
+function closeTriage(){
+  TRI.open = false;
+  document.getElementById('triage').hidden = true;
+  document.body.style.overflow = '';
+  apply();          // 标过的状态要在下面的表格和计数里立刻生效
+}
+
+function triageCard(r){
+  const u = safeUrl(r.url);
+  const nd = DET.has(detKey(r)) ? '' : (NO_DETAIL[r.platform] || '');
+  const tags = (r.skills || []).slice(0, 8)
+    .map(s => `<span class="tag">${esc(s)}</span>`).join('') || '<span class="hint">没采到技能标签</span>';
+  const place = [r.city, r.district].filter(Boolean).join('·') || '没写城市';
+  return `<div class="triage-card">
+    <div><span class="plat-badge p-${esc(r.platform)}">${esc(PNAME[r.platform] || r.platform)}</span>
+      <span class="hint"> · 首次采集 ${esc(String(r.fetched_at).slice(0, 10))}</span></div>
+    <h2 id="triage-title">${u ? `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(r.title)}</a>` : esc(r.title)}</h2>
+    <div class="triage-meta">${esc(r.company)} · <span class="triage-salary">${esc(r.salary_raw || '薪资没写')}</span> · ${esc(place)}<br>
+      经验 ${esc(r.experience_bucket || '未标注')} · 学历 ${esc(r.education_bucket || '未标注')}</div>
+    <div style="margin-top:10px">${tags}</div>
+    ${nd ? `<div class="hint" style="margin-top:8px">${esc(nd)}，细节点「打开原帖」去平台看。</div>` : ''}
+    <div class="triage-actions">
+      <button class="want" data-tri="想投">想投（1）</button>
+      <button class="no" data-tri="不合适">不合适（2）</button>
+      <button class="ghost" data-tri="跳过">跳过（3）</button>
+      ${u ? `<a class="triage-open" href="${esc(u)}" target="_blank" rel="noopener">打开原帖 ↗</a>` : ''}
+    </div>
+    <div class="triage-keys">只写本机状态，不发平台请求。跳过的这一轮不再出现，刷新页面后会回来。</div>
+  </div>`;
+}
+
+function triageSummary(){
+  const done = TRI.want + TRI.no + TRI.skip;
+  return `<div class="triage-empty">
+    <p>${done ? `这一轮看完 ${done} 条：想投 ${TRI.want} · 不合适 ${TRI.no} · 跳过 ${TRI.skip}。`
+               : '库里没有未标注的职位了。'}</p>
+    <p class="hint">${done ? '标过的已经写进库里，回到表格就能看到'
+                            + (TRI.want ? '；想投的那几条可以顺手点开原帖去投' : '') + '。' : ''}</p>
+    <div class="triage-actions" style="justify-content:center">
+      ${triagePool().length ? '<button id="tri-again">再来 10 条</button>' : ''}
+      <button class="ghost" id="tri-quit">回到表格</button>
+    </div>
+  </div>`;
+}
+
+function triageRender(){
+  const body = document.getElementById('triage-body');
+  const prog = document.getElementById('triage-progress');
+  if (TRI.i >= TRI.ids.length){
+    prog.textContent = '这一轮结束';
+    body.innerHTML = triageSummary();
+    const again = document.getElementById('tri-again');
+    if (again) again.onclick = () => startTriage(10);
+    document.getElementById('tri-quit').onclick = closeTriage;
+    return;
+  }
+  const r = DATA.find(x => String(x.id) === TRI.ids[TRI.i]);
+  if (!r){ TRI.i++; triageRender(); return; }
+  prog.textContent = `第 ${TRI.i + 1}/${TRI.ids.length} 条 · 还有 ${triagePool().length} 条没标过`;
+  body.innerHTML = triageCard(r);
+  body.querySelectorAll('[data-tri]').forEach(b => b.onclick = () => triageAnswer(b.dataset.tri));
+}
+
+async function triageAnswer(kind){
+  if (!TRI.open || triBusy || TRI.i >= TRI.ids.length) return;
+  const id = TRI.ids[TRI.i];
+  if (kind === '跳过'){ TRI.skip++; TRI.seen.add(id); TRI.i++; triageRender(); return; }
+  const row = DATA.find(x => String(x.id) === id);
+  triBusy = true;
+  try {
+    const res = await api('/api/status', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: +id, status: kind})});
+    if (row) row.status = res.status === undefined ? kind : res.status;
+    if (kind === '想投') TRI.want++; else TRI.no++;
+    TRI.seen.add(id);
+    TRI.i++;
+    triageRender();
+  } catch (e) {
+    document.getElementById('triage-progress').textContent = '没存上：' + e.message;
+  } finally {
+    triBusy = false;
+  }
+}
+
+document.getElementById('btn-triage').onclick = () => startTriage(10);
+document.getElementById('triage-close').onclick = closeTriage;
+document.addEventListener('keydown', e => {
+  if (!TRI.open) return;
+  const t = e.target;
+  if (t && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return;
+  if (e.key === 'Escape'){ closeTriage(); return; }
+  const pick = {'1':'想投', '2':'不合适', '3':'跳过'}[e.key];
+  if (pick){ e.preventDefault(); triageAnswer(pick); }
+});
+
+"""
+
 SLOT_RE = re.compile("|".join(map(re.escape, (
     "__COLLECT_PANEL__", "__COLLECT_SCRIPT__", "__DETAIL_SCRIPT__", "__STATUS_SCRIPT__",
     "__DELETE_TH__", "__DELETE_BAR__", "__DELETE_SCRIPT__",
     "__STATUS_CONSTS__", "__CITY_OPTIONS__", "__STALE_DAYS__", "__NO_DETAIL__",
     "__NO_LIST_SKILLS__",
+    "__TRIAGE_BUTTON__", "__TRIAGE_PANEL__", "__TRIAGE_SCRIPT__",
     "__GENERATED_AT__", "__SUB_LINE__", "__BOOT_HOOK__", "__TOKEN__", "__DATA__",
     "__N__", "__IS_WEB__", "__DETAIL_TH__"))))
 
@@ -1368,6 +1526,10 @@ def _filter_html(sub_line: str, records: list[dict], *, web: bool,
         "__DELETE_TH__": DELETE_TH if web else "",
         "__DELETE_BAR__": DELETE_BAR if web else "",
         "__STATUS_SCRIPT__": STATUS_JS if web else "",
+        # 「过一遍」要写状态，静态版没有服务端可写，整块都不给
+        "__TRIAGE_BUTTON__": TRIAGE_BUTTON if web else "",
+        "__TRIAGE_PANEL__": TRIAGE_PANEL if web else "",
+        "__TRIAGE_SCRIPT__": TRIAGE_JS if web else "",
         "__STATUS_CONSTS__": ("const STATUS = {}; const NOTE_MAX = {}; const EXP_ORDER = {}; "
                               "const EDU_ORDER = {};").format(
             _embed_json(list(db.STATUS_LABELS)), db.NOTE_MAX,
