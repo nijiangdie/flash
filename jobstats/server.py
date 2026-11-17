@@ -376,10 +376,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": False, "error": "404"}, 404)
         if not self._check_token():
             return self._json({"ok": False, "error": "安全校验失败"}, 403)
+        # Content-Length 得先验再读：负数会让 rfile.read(-1) 一直读到连接关闭，
+        # 线程就挂在那了；非数字以前掉进兜底变成 500。请求体最大的是删除行号列表，
+        # 1MB 绰绰有余，超了直接拒，不替陌生客户端缓冲大 body。
         try:
-            body = json.loads(
-                self.rfile.read(int(self.headers.get("Content-Length", 0)))
-                .decode("utf-8") or "{}")
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            return self._json({"ok": False, "error": "Content-Length 不是数字"}, 400)
+        if not 0 <= length <= 1_000_000:
+            return self._json({"ok": False, "error": "请求体大小不合理（0~1MB）"}, 400)
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
         except Exception:
             return self._json({"ok": False, "error": "请求体不是合法 JSON"}, 400)
 
@@ -430,6 +437,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if not query:
             return self._json({"ok": False, "error": "请输入搜索关键词"}, 400)
+        if details.fetch_in_progress():
+            # 反方向也要让路：正文在抓时开采集，两条通道就同时撞平台了
+            return self._json({"ok": False,
+                               "error": "正文抓取正在进行，等它结束再开始采集。"}, 409)
         if platforms == ["boss"]:
             # 单选 Boss 时保持原样：窗口起不来就当场说清楚，不创建一个注定失败的任务
             hint = boss.ensure_window()

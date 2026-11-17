@@ -7,6 +7,8 @@
 不是每个平台都能按条补正文：这样的平台写在 NO_DETAIL 里，这一层直接跳过并说明原因，
 不让页面和 CLI 把"这条通道不能这样补"说成"职位已下架"。
 """
+import threading
+
 from . import db
 from .browser import first_line, login_block_reason, polite_sleep
 from .collectors import boss, zhitong
@@ -15,6 +17,15 @@ from .config import DETAIL_DAILY_CAP
 FETCHERS = {"boss": boss.fetch_detail, "zhitong": zhitong.fetch_detail}
 # 判"这个平台现在能不能开工"要读模块上的 LOGIN_COOKIES，所以这里留模块本身
 MODULES = {"boss": boss, "zhitong": zhitong}
+
+# 详情页请求全项目只许一条在跑：页面按钮自己会禁用，但两个标签页（或直接调接口）
+# 能同时进来，两边都读到 19/20 就各抓一条，额度超了、请求也并发了。
+_FETCH_LOCK = threading.Lock()
+
+
+def fetch_in_progress() -> bool:
+    """现在有没有一批正文正在抓——采集入口据此让路，别让两条通道同时撞平台。"""
+    return _FETCH_LOCK.locked()
 
 # 这些平台没法按条补正文，而原因不是"这条职位出问题了"。
 # 这句话给页面、CLI 和接口共用，免得再把能力限制说成下架或风控。
@@ -52,6 +63,18 @@ def check_detail_cap() -> int:
 
 def collect_details(jobs: list[dict], limit: int | None = None,
                     force: bool = False) -> dict:
+    """逐条抓正文入库（同一时刻只许一批在跑，第二批直接拒绝而不是排队）。"""
+    if not _FETCH_LOCK.acquire(blocking=False):
+        raise RuntimeError("已有一批正文正在抓取，等它结束再来。"
+                           "详情页请求不并发：并发了额度会算乱，平台风控也记账号。")
+    try:
+        return _collect_details(jobs, limit=limit, force=force)
+    finally:
+        _FETCH_LOCK.release()
+
+
+def _collect_details(jobs: list[dict], limit: int | None = None,
+                     force: bool = False) -> dict:
     """逐条抓正文入库。已有正文的默认跳过（force=True 则重抓）；
     NO_DETAIL 里的平台一条都不试，直接算进 unreachable。"""
     remaining = check_detail_cap()

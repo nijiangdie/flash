@@ -255,8 +255,11 @@ def collect(query: str, city: str = "东莞", max_pages: int = MAX_PAGES_DEFAULT
 # ---- 职位正文 ----
 # 详情页同样是服务端渲染：正文在 <pre class="common-text-desc pos-desc"> 里原样带着换行，
 # 公司简介用的是 com-desc 类名，靠 pos-desc 区分开。
-_DESC_RE = re.compile(r'<pre class="[^"]*\bpos-desc\b[^"]*"[^>]*>(.*?)</pre>', re.S)
-_KEYWORDS_RE = re.compile(r'<ul class="keyword-tags[^"]*">(.*?)</ul>', re.S)
+# 2026-11-16 实测平台把标签属性拆成了多行（<pre\n class="…"\n>），旧正则只认
+# class 紧跟标签名的单行写法，正文会静默解析成 0 字；[^>]* 本来就吃换行，
+# 把"标签名与 class 之间"放宽成任意属性即可，两种写法都认。
+_DESC_RE = re.compile(r'<pre\b[^>]*\bclass="[^"]*\bpos-desc\b[^"]*"[^>]*>(.*?)</pre>', re.S)
+_KEYWORDS_RE = re.compile(r'<ul\b[^>]*\bclass="keyword-tags[^"]*"[^>]*>(.*?)</ul>', re.S)
 
 
 def parse_detail(body: str) -> dict:

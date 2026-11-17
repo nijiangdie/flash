@@ -860,7 +860,11 @@ def restore_batch(batch: str, trash_dir=None) -> dict | None:
     with _conn() as c:
         have = _tables(c)
         n["jobs"] = _restore_rows(c, "jobs", RESTORE_JOBS, data.get("jobs"), have)
-        n["details"] = _restore_rows(c, "job_details", DETAIL_COLUMNS, data.get("details"), have)
+        # source 得跟着回去：丢了它，list 随采正文会被 COALESCE 当成 detail，
+        # 今天的 20 条逐条额度被假占（2026-11-16 库副本往返实测发现）。
+        # 老批次文件没有 source 键时取 None，行为跟修复前一样，不会报错。
+        n["details"] = _restore_rows(c, "job_details", DETAIL_COLUMNS + ("source",),
+                                     data.get("details"), have)
         n["analysis"] = _restore_rows(c, "job_analysis", ANALYSIS_COLUMNS,
                                       data.get("analysis"), have)
         # 撤销 = "这批我反悔了"，屏蔽名单里得跟着退，否则职位虽然回到了库里，

@@ -2395,6 +2395,24 @@ ZT_DETAIL_HTML = """
 </div></div>
 """
 
+# 2026-11-16 真实详情页的新写法：标签属性拆成多行（job_Y6LwN8iSB_S9dP6EtKqhag 实测）。
+ZT_DETAIL_HTML_MULTILINE = """
+<div class="common-text-box pos-requirement">
+  <pre
+    class="common-text-desc pos-desc"
+  >岗位职责
+1. 负责 ERP 系统运维。</pre>
+  <pre
+    class="common-text-desc com-desc"
+  >公司简介：不应出现。</pre>
+</div>
+<ul
+  class="keyword-tags flex_Fw"
+>
+  <li class="item-tag">ERP运维</li>
+</ul>
+"""
+
 BOSS_DETAIL_HTML = """
 <div class="job-detail-section">
   <h3>职位描述</h3>
@@ -2435,6 +2453,16 @@ class TestDetailParsers(unittest.TestCase):
         from jobstats.collectors import zhitong
         self.assertEqual(zhitong.parse_detail("<html><body>下架</body></html>"),
                          {"description": "", "keyword_tags": []})
+
+    def test_zhitong_multiline_tag_attributes_still_parse(self):
+        """属性拆成多行也得认：2026-11-16 平台改版，旧正则只认单行写法，
+        正文静默变 0 字、关键词却照常出——看起来像"职位下架"，其实是解析漏了。"""
+        from jobstats.collectors import zhitong
+        d = zhitong.parse_detail(ZT_DETAIL_HTML_MULTILINE)
+        self.assertIn("岗位职责", d["description"])
+        self.assertIn("1. 负责 ERP 系统运维。", d["description"])
+        self.assertNotIn("公司简介", d["description"])
+        self.assertEqual(d["keyword_tags"], ["ERP运维"])
 
     def test_boss_line_breaks_come_from_br_and_stop_at_container(self):
         from jobstats.collectors import boss
@@ -2739,6 +2767,44 @@ class TestDetailSkipsDeadLogin(TempDbCase):
                                            limit=None, force=False))
         self.assertIn("重新扫码之后再跑这条命令", buf.getvalue())
         self.assertIn("一条请求都没发", buf.getvalue())
+
+
+class TestDetailConcurrency(TempDbCase):
+    """详情页请求同一时刻只许一批：两个标签页同时进来，第二批直接拒绝。
+    并发了额度会算乱（两边都读到 19/20 就各抓一条），平台风控也记账号。"""
+
+    def test_second_batch_is_rejected_while_first_runs(self):
+        with details._FETCH_LOCK:
+            with self.assertRaises(RuntimeError) as ctx:
+                details.collect_details([{"platform": "zhitong", "platform_job_id": "j1"}])
+        self.assertIn("正在抓取", str(ctx.exception))
+        self.assertFalse(details.fetch_in_progress())
+
+    def test_lock_is_released_after_a_normal_run(self):
+        db.save_jobs([make_record(platform="zhitong", platform_job_id="j1")])
+
+        def fake(j):
+            return {"platform": "zhitong", "platform_job_id": "j1",
+                    "description": "d", "keyword_tags": [], "url": "u"}
+
+        with mock.patch.object(details, "FETCHERS", {"zhitong": fake}), \
+             mock.patch.object(details, "polite_sleep"):
+            details.collect_details([db.fetch_all()[0]])
+        self.assertFalse(details.fetch_in_progress())
+
+    def test_lock_is_released_even_when_batch_raises(self):
+        with mock.patch.object(details, "check_detail_cap",
+                               side_effect=RuntimeError("额度熔断")):
+            with self.assertRaises(RuntimeError):
+                details.collect_details([{"platform": "zhitong", "platform_job_id": "j1"}])
+        self.assertFalse(details.fetch_in_progress())
+
+    def test_collect_api_waits_while_detail_fetch_runs(self):
+        with details._FETCH_LOCK:
+            res = post_api("/api/collect", {"platforms": ["zhitong"],
+                                           "cities": ["东莞"], "query": "IT"})
+        self.assertEqual(res["status"], 409)
+        self.assertIn("正文抓取正在进行", res["obj"]["error"])
 
 
 class TestDetailApiEndpoints(unittest.TestCase):
@@ -3407,6 +3473,29 @@ class TestCollectApi(TempDbCase):
         self.assertNotIn("<option", html)
 
 
+class TestContentLengthGuard(unittest.TestCase):
+    """Content-Length 先验再读：-1 会让 read(-1) 一直读到连接关闭、线程挂住，
+    非数字以前掉进兜底变 500。现在都当场 400，也不替陌生客户端缓冲大 body。"""
+
+    def _post_raw(self, cl):
+        h = object.__new__(server.Handler)
+        h.path = "/api/status"
+        h.headers = {"Content-Length": cl, "X-Token": "T"}
+        h.rfile = io.BytesIO(b"{}")
+        out = {}
+        h._json = lambda obj, status=200: out.update(obj=obj, status=status)
+        with mock.patch.object(server.Handler, "token", "T"):
+            h.do_POST()
+        return out
+
+    def test_negative_non_numeric_and_oversized_are_400(self):
+        for cl in ("-1", "abc", "2000000"):
+            with self.subTest(cl=cl):
+                res = self._post_raw(cl)
+                self.assertEqual(res["status"], 400)
+                self.assertFalse(res["obj"]["ok"])
+
+
 class TestAnalysisApi(TempDbCase):
     def test_writes_a_score(self):
         db.save_jobs([make_record()])
@@ -3857,6 +3946,23 @@ class TestJobDeletion(TrashCase):
         batch = db.delete_jobs([seed_deletable()])["batch"]
         self.assertIsNotNone(db.restore_batch(batch))
         self.assertIsNone(db.restore_batch(batch))
+
+    def test_undo_keeps_detail_source_so_list_body_never_eats_quota(self):
+        """job51 列表随采的正文 source='list'，不占逐条额度；撤销要是丢了这列，
+        COALESCE(source,'detail') 会把它当成逐条抓的，今天 20 条额度被假占
+        （2026-11-16 库副本往返实测发现）。"""
+        db.save_jobs([make_record(platform="job51", platform_job_id="g1")])
+        db.save_list_details([{"platform": "job51", "platform_job_id": "g1",
+                               "description": "列表随采正文", "keyword_tags": [], "url": "u"}])
+        self.assertEqual(db.count_details_today(), 0)
+        jid = db.fetch_all()[0]["id"]
+        batch = db.delete_jobs([jid])["batch"]
+        db.restore_batch(batch)
+        with db._conn() as c:
+            src = c.execute("SELECT source FROM job_details"
+                            " WHERE platform='job51' AND platform_job_id='g1'").fetchone()[0]
+        self.assertEqual(src, "list")
+        self.assertEqual(db.count_details_today(), 0)
 
     def test_undo_does_not_clobber_a_newer_mark(self):
         """撤销用的是 INSERT OR IGNORE：删后又放出来重采/又标的，以库里当下那条为准。"""
