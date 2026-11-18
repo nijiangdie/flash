@@ -172,6 +172,9 @@ def _record(attrs: dict, block: str) -> dict | None:
         "skills": [],
         "welfare": welfare,
         "url": f"{SITE}/{city_en}/job_{key}" if city_en else "",
+        # 平台给的刷新时间原文（"10小时前"/"10月28日"两种写法）。智通不暴露首次发布
+        # 时刻，这一列就是平台口径的"发布/刷新"，不换算成绝对时间免得造出假精度。
+        "published_raw": _clean(attrs.get("fredatestr")),
     }
 
 
@@ -268,6 +271,43 @@ def parse_detail(body: str) -> dict:
     km = _KEYWORDS_RE.search(body)
     return {"description": html_text.to_lines(m.group(1)) if m else "",
             "keyword_tags": html_text.list_items(km.group(1)) if km else []}
+
+
+# 招聘状态在主职位隐藏域 pcDetail 的 data-state 上（2026-11-18 实测：
+# 在职="正常招聘"、下架="停止招聘"或"已过期"，两种下架页都挂"职位已过期"按钮、
+# 没有投递入口）。下架页的旧正文仍原样留在页面上，
+# 所以判下架只能认这个标志，不能靠"正文为空"。标签属性可能拆多行，先定位再截到标签尾。
+_STATE_RE = re.compile(r'data-state="([^"]*)"')
+
+
+def parse_state(body: str) -> str | None:
+    """详情页主职位的招聘状态原文；认不出（结构变了）返回 None。"""
+    i = body.find('id="pcDetail"')
+    if i < 0:
+        return None
+    end = body.find(">", i)
+    if end < 0:
+        return None
+    m = _STATE_RE.search(body[i:end])
+    return m.group(1) if m else None
+
+
+def verify_detail(job: dict) -> dict | None:
+    """打开详情页核实招聘状态，顺带把正文解析出来（在招时调用方落库）。
+    返回 {"state", "description", "keyword_tags", ...}；请求失败返回 None。"""
+    url = job.get("url") or ""
+    if not url:
+        print("  这条没有详情页链接，跳过。")
+        return None
+    try:
+        body = _fetch(url)
+    except Exception as e:
+        print(f"  详情页获取失败: {str(e)[:90]}")
+        return None
+    state = parse_state(body)
+    parsed = parse_detail(body) if state == "正常招聘" else {"description": "", "keyword_tags": []}
+    return dict(parsed, state=state, platform=job["platform"],
+                platform_job_id=job["platform_job_id"], url=url)
 
 
 def fetch_detail(job: dict) -> dict | None:

@@ -240,11 +240,11 @@ class TestBucketPlumbing(TempDbCase):
     def test_row_cells_line_up_with_the_header(self):
         """bucketTd 自己就带 <td>，再套一层就整行串列（这次真踩到了）。列数对不上就报错。"""
         row = re.search(r"return `<tr>(.*?)</tr>`;", report.FILTER_TEMPLATE, re.S).group(1)
-        whole_cells = ("fetchedTd}", "seenTd}", "stCell}", "scoreCell}", "det}", "delCell}",
-                       "skillTd}")
+        whole_cells = ("fetchedTd}", "seenTd}", "pubTd}", "stCell}", "scoreCell}",
+                       "det}", "delCell}", "skillTd}")
         cells = (row.count("<td") + row.count("bucketTd(")
                  + sum(row.count(x) for x in whole_cells))
-        self.assertEqual(14, cells, "网页版 14 列：静态页去掉『正文』『删』两列 = 12")
+        self.assertEqual(15, cells, "网页版 15 列：静态页去掉『正文』『删』两列 = 13")
         self.assertNotIn("<td>${bucketTd", report.FILTER_TEMPLATE)
         self.assertNotIn("<td>${seenTd", report.FILTER_TEMPLATE)
         self.assertNotIn("<td>${skillTd", report.FILTER_TEMPLATE)
@@ -3046,9 +3046,9 @@ class TestCrossRef(TempDbCase):
         cross = self.by(crossref.attach(db.fetch_all()), "job51")["cross"]
         self.assertTrue(cross[0]["has_detail"])
 
-    def test_panel_keeps_the_fourteen_column_layout(self):
-        """对照面板占满现有的 14 列，不新增表头——列数一变整张表就错位。"""
-        self.assertIn("cell.colSpan = 14", report.DETAIL_JS)
+    def test_panel_keeps_the_fifteen_column_layout(self):
+        """对照面板占满现有的 15 列（含发布/刷新），不新增表头——列数一变整张表就错位。"""
+        self.assertIn("cell.colSpan = 15", report.DETAIL_JS)
         self.assertIn("toggleXref", report.DETAIL_JS)
         self.assertIn("data-xref", report.FILTER_TEMPLATE)
         static = report._filter_html(report.STATIC_SUB_LINE, [make_record()], web=False)
@@ -3136,7 +3136,8 @@ class TestApplicationStatus(TempDbCase):
         db.export_csv(out)
         text = out.read_text(encoding="utf-8-sig")
         head = text.splitlines()[0].split(",")
-        self.assertEqual(head[-2:], ["fetched_at", "description"])
+        self.assertEqual(head[-4:], ["published_raw", "verified_at", "delisted_at",
+                                     "description"])
         self.assertIn("status", head)
         self.assertIn("约面", text)
         self.assertIn('"带逗号,""和引号"""', text)
@@ -4400,6 +4401,265 @@ class TestReportWithoutChartLibrary(unittest.TestCase):
     def test_chart_script_braces_stay_balanced(self):
         # 这个分支是 if/else 两块，少闭合一个 } 的现场就是"页面照开、图全没了"
         self.assertEqual(self.html.count("{"), self.html.count("}"))
+
+
+class TestPublishedAndPlatformState(TempDbCase):
+    """平台发布时间/招聘状态三列：采集即核实、过期标志、刷新不抹平台原文。"""
+
+    def test_expire_flag_marks_delisted_and_verified(self):
+        db.save_jobs([make_record(platform="job51", platform_job_id="e1",
+                                  published_raw="2026-11-17 18:05:51", _expire=True)])
+        row = db.fetch_all()[0]
+        self.assertTrue(row["delisted_at"])
+        self.assertTrue(row["verified_at"])
+        self.assertEqual(row["published_raw"], "2026-11-17 18:05:51")
+
+    def test_recollect_without_flag_clears_delisted(self):
+        db.save_jobs([make_record(platform="job51", platform_job_id="e1", _expire=True)])
+        db.save_jobs([make_record(platform="job51", platform_job_id="e1")])
+        row = db.fetch_all()[0]
+        self.assertEqual(row["delisted_at"], "")
+        self.assertTrue(row["verified_at"])
+
+    def test_blank_published_keeps_previous_platform_text(self):
+        db.save_jobs([make_record(platform="zhitong", platform_job_id="p1",
+                                  published_raw="10小时前")])
+        db.save_jobs([make_record(platform="zhitong", platform_job_id="p1",
+                                  published_raw="")])
+        self.assertEqual(db.fetch_all()[0]["published_raw"], "10小时前")
+
+    def test_expire_is_not_a_whitelist_field_but_is_accepted(self):
+        self.assertNotIn("_expire", config.ALLOWED_FIELDS)
+        self.assertIn("published_raw", config.ALLOWED_FIELDS)
+        db.save_jobs([make_record(_expire=False)])   # 不该抛白名单错
+        self.assertEqual(db.fetch_all()[0]["delisted_at"], "")
+
+    def test_old_db_gets_the_three_columns_without_fake_backfill(self):
+        with db._conn() as c:
+            c.execute("DROP TABLE jobs")
+            c.execute("CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                      "platform TEXT NOT NULL, platform_job_id TEXT NOT NULL, title TEXT, "
+                      "company TEXT, salary_raw TEXT, salary_min REAL, salary_max REAL, "
+                      "salary_months INTEGER, city TEXT, district TEXT, experience TEXT, "
+                      "education TEXT, industry TEXT, company_scale TEXT, skills TEXT, "
+                      "welfare TEXT, url TEXT, fetched_at TEXT, status TEXT, status_at TEXT, "
+                      "note TEXT, last_seen_at TEXT, UNIQUE(platform, platform_job_id))")
+            c.execute("INSERT INTO jobs(platform, platform_job_id, title, fetched_at, "
+                      "last_seen_at) VALUES('zhitong','old','老职位','2026-09-01 00:00:00',"
+                      "'2026-09-01 00:00:00')")
+        db.init_db()
+        row = db.fetch_all()[0]
+        self.assertEqual(row["published_raw"], "")
+        self.assertEqual(row["verified_at"], "")
+        self.assertEqual(row["delisted_at"], "")
+
+    def test_undo_restores_verified_and_delisted(self):
+        db.save_jobs([make_record(platform="zhitong", platform_job_id="u1", _expire=True)])
+        jid = db.fetch_all()[0]["id"]
+        res = db.delete_jobs([jid], trash_dir=Path(self._tmp.name) / "trash")
+        back = db.restore_batch(res["batch"], trash_dir=Path(self._tmp.name) / "trash")
+        self.assertEqual(back["jobs"], 1)
+        row = db.fetch_all()[0]
+        self.assertTrue(row["delisted_at"])
+        self.assertTrue(row["verified_at"])
+
+
+class TestZhitongStateParse(unittest.TestCase):
+    """下架判据是 pcDetail 的 data-state，不是正文空不空（下架页旧正文还在）。"""
+
+    TAG = ('<input id="other" type="hidden" data-cityid="1"\n  />\n  <input\n'
+           '    id="pcDetail"\n    type="hidden"\n    data-posname="x"\n'
+           '    data-state="{state}"\n  />')
+
+    def test_state_reads_multiline_pcDetail_tag(self):
+        from jobstats.collectors import zhitong
+        self.assertEqual(zhitong.parse_state(self.TAG.format(state="停止招聘")), "停止招聘")
+        self.assertEqual(zhitong.parse_state(self.TAG.format(state="正常招聘")), "正常招聘")
+
+    def test_missing_state_is_none_not_delisted(self):
+        from jobstats.collectors import zhitong
+        self.assertIsNone(zhitong.parse_state("<div>没有主职位隐藏域</div>"))
+        self.assertIsNone(zhitong.parse_state('<input id="pcDetail" data-posname="x">'))
+
+    def test_list_record_carries_fredatestr_as_published(self):
+        from jobstats.collectors import zhitong
+        html = ('<li class="position pos-item PosName" data-id="1" data-posname="IT运维"'
+                ' data-fredatestr="10小时前" data-cityname="东莞" data-urlcityen="dongguan"'
+                ' data-positionkey="k1"></li>')
+        rec = zhitong.parse_page(html)[0]
+        self.assertEqual(rec["published_raw"], "10小时前")
+
+
+class TestVerifyStale(TempDbCase):
+    """核实疑似下架：读平台状态、共用详情页额度、认不出的状态不猜。"""
+
+    def seed_old(self, pjid):
+        db.save_jobs([make_record(platform="zhitong", platform_job_id=pjid,
+                                  url=f"https://www.job5156.com/dongguan/job_{pjid}")])
+        with db._conn() as c:
+            c.execute("UPDATE jobs SET last_seen_at='2026-09-01 00:00:00', "
+                      "verified_at=NULL WHERE platform_job_id=?", (pjid,))
+
+    def test_delisted_and_alive_both_marked_alive_saves_body(self):
+        self.seed_old("d1")
+        self.seed_old("a1")
+
+        def fake(job):
+            if job["platform_job_id"] == "d1":
+                return {"state": "停止招聘", "description": "", "keyword_tags": [],
+                        "platform": "zhitong", "platform_job_id": "d1", "url": "u"}
+            return {"state": "正常招聘", "description": "还在招的正文", "keyword_tags": [],
+                    "platform": "zhitong", "platform_job_id": "a1", "url": "u"}
+
+        with mock.patch.object(details.zhitong, "verify_detail", side_effect=fake), \
+             mock.patch.object(details, "polite_sleep"), redirect_stdout(io.StringIO()):
+            res = details.verify_stale(days=14)
+        self.assertEqual((res["delisted"], res["alive"], res["saved"]), (1, 1, 1))
+        rows = {r["platform_job_id"]: r for r in db.fetch_all()}
+        self.assertTrue(rows["d1"]["delisted_at"])
+        self.assertEqual(rows["a1"]["delisted_at"], "")
+        self.assertTrue(rows["a1"]["verified_at"])
+        self.assertIsNotNone(db.get_detail("zhitong", "a1"))
+        self.assertEqual(db.count_details_today(), 1)
+        self.assertEqual(db.count_delisted_today(), 1)
+
+    def test_recently_verified_alive_rows_are_not_rechecked(self):
+        self.seed_old("a2")
+        with mock.patch.object(details.zhitong, "verify_detail",
+                               return_value={"state": "正常招聘", "description": "",
+                                             "keyword_tags": [], "platform": "zhitong",
+                                             "platform_job_id": "a2", "url": "u"}), \
+             mock.patch.object(details, "polite_sleep"), redirect_stdout(io.StringIO()):
+            self.assertEqual(details.verify_stale(days=14)["alive"], 1)
+        self.assertEqual(db.verify_candidates(14), [])
+
+    def test_expired_state_counts_as_delisted(self):
+        # 2026-11-18 真链撞见的第三种状态：页面挂"职位已过期"按钮、无投递入口
+        self.seed_old("x2")
+        with mock.patch.object(details.zhitong, "verify_detail",
+                               return_value={"state": "已过期", "description": "",
+                                             "keyword_tags": [], "platform": "zhitong",
+                                             "platform_job_id": "x2", "url": "u"}), \
+             mock.patch.object(details, "polite_sleep"), redirect_stdout(io.StringIO()):
+            res = details.verify_stale(days=14)
+        self.assertEqual(res["delisted"], 1)
+        self.assertTrue(db.fetch_all()[0]["delisted_at"])
+
+    def test_delisted_checks_share_the_detail_cap(self):
+        self.seed_old("d1")
+        with mock.patch.object(db, "count_details_today", return_value=19), \
+             mock.patch.object(db, "count_delisted_today", return_value=1), \
+             mock.patch.object(details.zhitong, "verify_detail",
+                               side_effect=AssertionError("额度满了不该发请求")):
+            with self.assertRaises(RuntimeError) as ctx:
+                details.verify_stale(days=14)
+        self.assertIn("熔断", str(ctx.exception))
+
+    def test_unknown_or_missing_state_stops_without_marking(self):
+        self.seed_old("x1")
+        before = db.fetch_all()[0]["verified_at"]   # 采集入库时已写过一次
+        for state in ("暂停招聘", None):
+            with mock.patch.object(details.zhitong, "verify_detail",
+                                   return_value={"state": state, "description": "",
+                                                 "keyword_tags": [], "platform": "zhitong",
+                                                 "platform_job_id": "x1", "url": "u"}), \
+                 mock.patch.object(details, "polite_sleep"), \
+                 redirect_stdout(io.StringIO()):
+                res = details.verify_stale(days=14)
+            self.assertEqual(res["checked"], 1)
+            self.assertEqual((res["delisted"], res["alive"]), (0, 0))
+            row = db.fetch_all()[0]
+            self.assertEqual(row["verified_at"], before)
+            self.assertEqual(row["delisted_at"], "")
+
+    def test_second_verify_batch_is_rejected_while_first_runs(self):
+        with details._FETCH_LOCK:
+            with self.assertRaises(RuntimeError):
+                details.verify_stale(days=14)
+        self.assertFalse(details.fetch_in_progress())
+
+
+class TestVerifyApi(TempDbCase):
+    def _mgr(self, current=None):
+        return mock.patch.object(server.Handler, "manager",
+                                 mock.Mock(current_id=lambda: current))
+
+    def test_verify_passes_summary_through(self):
+        with self._mgr(), mock.patch.object(details, "verify_stale",
+                                            return_value={"checked": 2, "delisted": 1,
+                                                          "alive": 1, "saved": 1,
+                                                          "failed": 0, "left": 18}) as m:
+            res = post_api("/api/verify", {"limit": 5})
+        self.assertEqual(res["status"], 200)
+        self.assertEqual(res["obj"]["delisted"], 1)
+        self.assertEqual(m.call_args.kwargs["limit"], 5)
+
+    def test_verify_waits_for_collect_and_for_detail_lock(self):
+        with self._mgr(current="t1"):
+            res = post_api("/api/verify", {})
+        self.assertEqual(res["status"], 409)
+        with self._mgr(), details._FETCH_LOCK:
+            res = post_api("/api/verify", {})
+        self.assertEqual(res["status"], 409)
+
+    def test_verify_cap_error_is_400_not_500(self):
+        with self._mgr(), mock.patch.object(details, "verify_stale",
+                                            side_effect=RuntimeError("额度熔断")):
+            res = post_api("/api/verify", {})
+        self.assertEqual(res["status"], 400)
+        self.assertIn("熔断", res["obj"]["error"])
+
+
+class TestPrune(TempDbCase):
+    def seed(self, pjid, seen, status=None, delisted=False):
+        db.save_jobs([make_record(platform="zhitong", platform_job_id=pjid,
+                                  _expire=delisted)])
+        with db._conn() as c:
+            c.execute("UPDATE jobs SET last_seen_at=? WHERE platform_job_id=?",
+                      (seen, pjid))
+        if status:
+            jid = [r for r in db.fetch_all() if r["platform_job_id"] == pjid][0]["id"]
+            db.set_status(jid, status)
+
+    def test_candidates_skip_annotated_and_fresh_rows(self):
+        old = (datetime.now() - timedelta(days=40)).strftime("%Y-%m-%d %H:%M:%S")
+        fresh = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.seed("old1", old)
+        self.seed("want1", old, status="想投")
+        self.seed("new1", fresh)
+        self.seed("del1", fresh, delisted=True)   # 确认下架的不受天数限制
+        ids = {r["platform_job_id"] for r in db.prune_candidates(30)}
+        self.assertEqual(ids, {"old1", "del1"})
+
+    def test_dry_run_does_not_touch_db_and_apply_is_undoable(self):
+        from types import SimpleNamespace
+        old = (datetime.now() - timedelta(days=40)).strftime("%Y-%m-%d %H:%M:%S")
+        self.seed("old1", old)
+        trash = Path(self._tmp.name) / "trash"
+        with mock.patch.object(db, "TRASH_DIR", trash), redirect_stdout(io.StringIO()) as buf:
+            cli.cmd_prune(SimpleNamespace(days=30, apply=False))
+        self.assertIn("预览", buf.getvalue())
+        self.assertEqual(len(db.fetch_all()), 1)
+        with mock.patch.object(db, "TRASH_DIR", trash), redirect_stdout(io.StringIO()):
+            cli.cmd_prune(SimpleNamespace(days=30, apply=True))
+        self.assertEqual(db.fetch_all(), [])
+        batch = db.trash_batches(trash_dir=trash)[0]["batch"]
+        db.restore_batch(batch, trash_dir=trash)
+        self.assertEqual(len(db.fetch_all()), 1)
+
+
+class TestPublishedColumnUi(unittest.TestCase):
+    def test_both_versions_have_the_published_column_and_delisted_filter(self):
+        web = report.render_web([make_record()], "T", "")
+        static = report._filter_html(report.STATIC_SUB_LINE, [make_record()], web=False)
+        for html in (web, static):
+            self.assertIn("<th>发布/刷新</th>", html)
+            self.assertIn('value="delisted"', html)
+            self.assertIn("发布/刷新", html)      # 页面 CSV 表头也带
+        self.assertIn("btn-verify", web)
+        self.assertNotIn("btn-verify", static)   # 核实要走本地服务，静态页没有
+        self.assertIn("r.delisted_at", web)
+        self.assertIn('class="delisted"', web)
 
 
 if __name__ == "__main__":

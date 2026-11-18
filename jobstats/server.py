@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, urlparse
 
 from . import browser, db, details, report
 from .collectors import COLLECTORS, boss, collect_and_save
-from .config import DAILY_CAP, DETAIL_DAILY_CAP, LOG_DIR, MAX_PAGES_DEFAULT
+from .config import DAILY_CAP, DETAIL_DAILY_CAP, LOG_DIR, MAX_PAGES_DEFAULT, STALE_AFTER_DAYS
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -372,7 +372,7 @@ class Handler(BaseHTTPRequestHandler):
     def _post(self):
         path = self.path.split("?")[0]
         if path not in ("/api/collect", "/api/detail", "/api/status", "/api/analysis",
-                        "/api/delete", "/api/restore"):
+                        "/api/delete", "/api/restore", "/api/verify"):
             return self._json({"ok": False, "error": "404"}, 404)
         if not self._check_token():
             return self._json({"ok": False, "error": "安全校验失败"}, 403)
@@ -392,6 +392,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/detail":
             return self._detail(body)
+        if path == "/api/verify":
+            return self._verify(body)
         if path == "/api/status":
             return self._status(body)
         if path == "/api/analysis":
@@ -438,9 +440,10 @@ class Handler(BaseHTTPRequestHandler):
         if not query:
             return self._json({"ok": False, "error": "请输入搜索关键词"}, 400)
         if details.fetch_in_progress():
-            # 反方向也要让路：正文在抓时开采集，两条通道就同时撞平台了
+            # 反方向也要让路：正文/核实在跑时开采集，两条通道就同时撞平台了
             return self._json({"ok": False,
-                               "error": "正文抓取正在进行，等它结束再开始采集。"}, 409)
+                               "error": "正文抓取正在进行（抓正文或核实下架），"
+                                        "等它结束再开始采集。"}, 409)
         if platforms == ["boss"]:
             # 单选 Boss 时保持原样：窗口起不来就当场说清楚，不创建一个注定失败的任务
             hint = boss.ensure_window()
@@ -493,6 +496,29 @@ class Handler(BaseHTTPRequestHandler):
                               400)
         return self._json({"ok": True, "detail": stored,
                            "note": f"今日正文还能抓 {res['left']} 条"})
+
+    def _verify(self, body: dict):
+        """核实一小批疑似下架的老职位：同步跑完回总结（页面一次点 5 条，约几十秒）。
+        整批核实用 cli.py verify。与抓正文共用同一把锁、同一份详情页额度。"""
+        if self.manager.current_id():
+            return self._json({"ok": False,
+                               "error": "采集任务正在运行，先等它结束再核实。"}, 409)
+        if details.fetch_in_progress():
+            return self._json({"ok": False,
+                               "error": "详情页请求正在进行（抓正文或核实下架），等它结束再来。"},
+                              409)
+        try:
+            limit = int(body.get("limit") or 5)
+            days = int(body.get("days") or STALE_AFTER_DAYS)
+        except (TypeError, ValueError):
+            return self._json({"ok": False, "error": "limit/days 得是整数"}, 400)
+        limit = max(1, min(limit, DETAIL_DAILY_CAP))
+        days = max(1, min(days, 365))
+        try:
+            res = details.verify_stale(days=days, limit=limit)
+        except RuntimeError as e:
+            return self._json({"ok": False, "error": str(e)}, 400)
+        return self._json({"ok": True, **res})
 
     def _status(self, body: dict):
         """标注一条职位的投递进度：只写本地的状态/备注两列，不发任何平台请求。"""

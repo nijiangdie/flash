@@ -393,6 +393,7 @@ FILTER_TEMPLATE = """<!DOCTYPE html>
   button:disabled { opacity:.55; cursor:not-allowed; }
   .hint { color:var(--muted); font-size:12px; }
   .stale { color:#d83b01; }
+  .delisted { color:#a4262c; font-weight:600; }   /* 平台确认下架：比"疑似"更重一档 */
   .tcol { white-space:nowrap; }   /* 日期别在中间断行："2026-10-" / "13" 读起来很费劲 */
   .ftag { display:inline-flex; align-items:center; gap:5px; background:#eef3ff;
           color:var(--accent); border-radius:14px; padding:3px 10px; font-size:12px; }
@@ -489,6 +490,7 @@ __COLLECT_PANEL__
       <option value="">全部</option>
       <option value="fresh">最近 __STALE_DAYS__ 天见过的</option>
       <option value="stale">疑似已下架（超过 __STALE_DAYS__ 天没再采到）</option>
+      <option value="delisted">平台确认下架（核实过的）</option>
     </select>
     <span class="hint">平台不会告诉我们职位下架了，这里只能按"最后一次采到它是什么时候"推断，
     仅供参考；长期不投的关键词本来就不会再见到</span>
@@ -520,7 +522,7 @@ __DELETE_BAR__
 <div class="card">
   <table>
     <thead><tr><th>平台</th><th>职位</th><th>公司</th><th>薪资</th><th>城市</th>
-    <th>经验</th><th>学历</th><th>技能标签</th><th>首次采集</th><th>最近见到</th><th>状态</th><th>匹配度</th>__DETAIL_TH____DELETE_TH__</tr></thead>
+    <th>经验</th><th>学历</th><th>技能标签</th><th>首次采集</th><th>最近见到</th><th>发布/刷新</th><th>状态</th><th>匹配度</th>__DETAIL_TH____DELETE_TH__</tr></thead>
     <tbody id="tbody"></tbody>
   </table>
   <div class="pager">
@@ -689,7 +691,8 @@ function apply(){
     if (st.edu.size && !st.edu.has(r.education_bucket)) return false;
     if (st.exp.size && !st.exp.has(r.experience_bucket)) return false;
     if (st.status && (r.status || '') !== (st.status === '__none__' ? '' : st.status)) return false;
-    if (st.seen && (isStale(r) !== (st.seen === 'stale'))) return false;
+    if (st.seen === 'delisted') { if (!r.delisted_at) return false; }
+    else if (st.seen && (isStale(r) !== (st.seen === 'stale'))) return false;
     if (st.smin!==null || st.smax!==null){
       const m = mid(r);
       if (m===null) return false;
@@ -724,7 +727,8 @@ function renderActiveTags(){
   st.edu.forEach(v => tags.push({k:'edu', v, t:'学历: '+v}));
   st.exp.forEach(v => tags.push({k:'exp', v, t:'经验: '+v}));
   if (st.status) tags.push({k:'status', v:'', t:'状态: ' + (st.status==='__none__'?'未标注':st.status)});
-  if (st.seen) tags.push({k:'seen', v:'', t: st.seen==='stale' ? '只看疑似已下架' : '只看最近见过的'});
+  if (st.seen) tags.push({k:'seen', v:'', t: st.seen==='stale' ? '只看疑似已下架'
+    : st.seen==='delisted' ? '只看平台确认下架' : '只看最近见过的'});
   if (st.smin!==null || st.smax!==null){
     const t = '月薪: ' + (st.smin??'') + ' ~ ' + (st.smax??'') + 'K';
     tags.push({k:'salary', v:'', t});
@@ -862,12 +866,24 @@ function renderTable(){
       : `<td title="${esc(why)}">${Math.round(r.score)}</td>`;
     const delCell = WEB ? `<td><button class="chip" data-del="${esc(r.id)}"
       title="从本地库删掉这一条（可以撤销）">删</button></td>` : '';
-    // "最近见到"只到日：这一列是"最后一次采到它"，超过阈值就是疑似下架
+    // "最近见到"只到日：这一列是"最后一次采到它"，超过阈值就是疑似下架。
+    // 核实过的以平台结论为准：确认下架画 ✕，核实仍在招的 ⚠ 提示里写明核实时刻。
     const seen = String(seenAt(r)).slice(0, 10) || '—';
-    const seenTd = isStale(r)
+    const seenTd = r.delisted_at
+      ? `<td class="hint tcol"><span class="delisted" title="平台确认下架于 ${esc(r.delisted_at)}`
+        + `（核实时刻 ${esc(r.verified_at)}）">✕ ${esc(seen)}</span></td>`
+      : isStale(r) && r.verified_at
+      ? `<td class="hint tcol"><span class="stale" title="已经 ${Math.floor(daysUnseen(r))} 天没再采到，`
+        + `但 ${esc(r.verified_at)} 核实平台仍在招（可能只是搜索没露出）">⚠ ${esc(seen)}</span></td>`
+      : isStale(r)
       ? `<td class="hint tcol"><span class="stale" title="已经 ${Math.floor(daysUnseen(r))} 天没再采到，`
         + `平台那边大概已经下架了（这是我推断的，不是平台给的状态）">⚠ ${esc(seen)}</span></td>`
       : `<td class="hint tcol">${esc(seen)}</td>`;
+    // 发布/刷新是平台原文：智通给刷新时间、前程无忧给发布时间，Boss 接口不给这个字段
+    const pubTitle = r.published_raw
+      ? '平台给的发布/刷新时间原文（智通=刷新时间，前程无忧=发布时间）：' + r.published_raw
+      : '平台没给这个字段：Boss 接口不提供，补列之前采的老记录也没有';
+    const pubTd = `<td class="hint tcol" title="${esc(pubTitle)}">${esc(r.published_raw || '—')}</td>`;
     // 两列时间都只到日，完整时刻放悬停：带时分秒的话 1100px 宽的窗口会横向溢出
     const fetchedTd = `<td class="hint tcol" title="首次采到的完整时刻：${esc(r.fetched_at)}">`
       + `${esc(String(r.fetched_at).slice(0, 10))}</td>`;
@@ -876,10 +892,10 @@ function renderTable(){
       <td>${title}${xr ? `<div>${xr}</div>` : ''}</td><td>${esc(r.company)}</td><td>${sal}</td>
       <td>${esc([r.city,r.district].filter(Boolean).join('·'))}</td>
       ${bucketTd(r.experience_bucket, r.experience)}${bucketTd(r.education_bucket, r.education)}
-      ${skillTd}${fetchedTd}${seenTd}${stCell}${scoreCell}${det}${delCell}</tr>`;
+      ${skillTd}${fetchedTd}${seenTd}${pubTd}${stCell}${scoreCell}${det}${delCell}</tr>`;
   }).join('');
   document.getElementById('tbody').innerHTML = rows
-    || `<tr><td colspan="${WEB?14:12}" class="hint" style="text-align:center;padding:30px">没有符合筛选条件的职位，试试放宽条件</td></tr>`;
+    || `<tr><td colspan="${WEB?15:13}" class="hint" style="text-align:center;padding:30px">没有符合筛选条件的职位，试试放宽条件</td></tr>`;
   if (WEB) { bindDetails(); bindStatus(); bindDelete(); }
   document.getElementById('pg-info').textContent = rs.length
     ? `第 ${st.page}/${max} 页 · 共 ${rs.length} 条` : '';
@@ -889,7 +905,7 @@ function renderTable(){
 
 function exportCSV(){
   const head = ['平台','职位','公司','薪资原文','月薪下限K','月薪上限K','发薪月数','年薪估算万',
-    '城市','经验','学历','技能','福利','状态','备注','链接','首次采集','最近见到'];
+    '城市','经验','学历','技能','福利','状态','备注','链接','首次采集','最近见到','发布/刷新','确认下架于'];
   const lines = [head.join(',')];
   st.filtered.forEach(r => {
     const q = v => `"${String(v??'').replace(/"/g,'""')}"`;
@@ -899,7 +915,8 @@ function exportCSV(){
       m!==null ? (m*(r.salary_months||12)/10).toFixed(1) : '',
       [r.city,r.district].filter(Boolean).join('·'),
       r.experience, r.education, (r.skills||[]).join(' / '), (r.welfare||[]).join(' / '),
-      r.status||'', r.note||'', r.url, r.fetched_at, seenAt(r)].map(q).join(','));
+      r.status||'', r.note||'', r.url, r.fetched_at, seenAt(r),
+      r.published_raw||'', r.delisted_at||''].map(q).join(','));
   });
   const blob = new Blob(['\\ufeff'+lines.join('\\n')], {type:'text/csv;charset=utf-8'});
   const a = document.createElement('a');
@@ -1111,7 +1128,9 @@ DELETE_TH = "<th>删</th>"
 # 批量删除放在筛选条下面：要删的永远是"刚筛出来的这一批"，条件也只用说一次
 DELETE_BAR = """  <div class="row">
     <button class="ghost" id="btn-del-filtered">删除当前筛选出的职位</button>
-    <span class="hint">删的只是本机库里的记录，不会访问任何平台，也不影响你已经投出去的申请</span>
+    <button class="ghost" id="btn-verify">核实疑似下架（一次 5 条）</button>
+    <span class="hint">删的只是本机库里的记录，不会访问任何平台，也不影响你已经投出去的申请；
+      核实会逐条打开智通详情页读平台自己的招聘状态，占今日详情页额度</span>
   </div>
   <div class="row" id="undo-bar" style="display:none">
     <span class="hint" id="undo-text"></span>
@@ -1212,7 +1231,7 @@ async function toggleDetail(btn){
   const row = document.createElement('tr');
   row.className = 'det-row';
   const cell = document.createElement('td');
-  cell.colSpan = 14;
+  cell.colSpan = 15;
   row.appendChild(cell);
   tr.after(row);
   // 这条通道拿不到正文：把原因就地说明白，不发请求、不占今日正文额度
@@ -1229,7 +1248,7 @@ function toggleXref(btn){
   const row = document.createElement('tr');
   row.className = 'det-row';
   const cell = document.createElement('td');
-  cell.colSpan = 14;
+  cell.colSpan = 15;
   cell.appendChild(renderXref(+btn.dataset.xref));
   row.appendChild(cell);
   tr.after(row);
@@ -1309,7 +1328,29 @@ function bindDelete(){
     b.onclick = () => askDelete([b.dataset.del]));
   document.getElementById('btn-del-filtered').onclick =
     () => askDelete(st.filtered.map(r => String(r.id)));
+  document.getElementById('btn-verify').onclick = verifyStale;
   document.getElementById('btn-undo').onclick = undoDelete;
+}
+
+// 核实疑似下架：同步小批（5 条），读平台详情页自己的招聘状态标志。
+// 整批核实用 cli.py verify；这里一次点几条，几十秒内回总结。
+async function verifyStale(){
+  const b = document.getElementById('btn-verify');
+  b.disabled = true;
+  sayUndo('正在核实疑似下架的老职位（一次最多 5 条，逐条打开详情页，约几十秒）…', false);
+  try {
+    const r = await api('/api/verify', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({limit: 5})});
+    await refreshData();
+    sayUndo('核实 ' + r.checked + ' 条：确认下架 ' + r.delisted + '、仍在招 ' + r.alive
+      + (r.saved ? '（顺带入库正文 ' + r.saved + ' 条）' : '')
+      + (r.failed ? '、失败 ' + r.failed : '')
+      + '。今日详情页还剩 ' + (r.left ?? 0) + ' 条。', false);
+  } catch (e) {
+    sayUndo('核实失败：' + e.message, false);
+  } finally {
+    b.disabled = false;
+  }
 }
 
 async function askDelete(ids){

@@ -182,6 +182,11 @@ def collect(query: str, city: str = "全国", max_pages: int = MAX_PAGES_DEFAULT
                 if desc:
                     # 公共落库口把它摘出来写进 job_details，不进 jobs 表
                     rec["_description"] = desc
+                # 平台接口自带的发布时间与过期标志：翻页时页面本来就请求了这条接口，
+                # 读它不算额外请求。isExpire 缺失时不写 _expire，落库口就不动核实状态。
+                rec["published_raw"] = (item.get("issueDateString") or "").strip()
+                if "isExpire" in item:
+                    rec["_expire"] = str(item["isExpire"]).strip().lower() in ("1", "true", "yes")
                 href = (item.get("jobHref") or "").split("?", 1)[0]
                 if href.startswith("http"):
                     # 卡片里第一个 <a> 常常是公司主页，平台接口给的才是职位页

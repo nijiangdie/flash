@@ -54,7 +54,7 @@ ALLOWED_FIELDS = {
     "platform", "platform_job_id", "title", "company", "salary_raw",
     "salary_min", "salary_max", "salary_months", "city", "district",
     "experience", "education", "industry", "company_scale",
-    "skills", "welfare", "url", "fetched_at",
+    "skills", "welfare", "url", "published_raw", "fetched_at",
 }
 
 # 职位正文单独一张表、单独一份白名单：正文很长，混进 jobs 会把筛选台页面撑爆。

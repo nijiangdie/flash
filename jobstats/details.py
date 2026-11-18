@@ -12,7 +12,7 @@ import threading
 from . import db
 from .browser import first_line, login_block_reason, polite_sleep
 from .collectors import boss, zhitong
-from .config import DETAIL_DAILY_CAP
+from .config import DETAIL_DAILY_CAP, STALE_AFTER_DAYS
 
 FETCHERS = {"boss": boss.fetch_detail, "zhitong": zhitong.fetch_detail}
 # 判"这个平台现在能不能开工"要读模块上的 LOGIN_COOKIES，所以这里留模块本身
@@ -152,3 +152,79 @@ def _collect_details(jobs: list[dict], limit: int | None = None,
           f"今日还能抓 {left} 条")
     return {"saved": saved, "failed": failed, "skipped": skipped,
             "unreachable": unreachable, "left": left}
+
+
+def check_verify_cap() -> int:
+    """核实下架也要逐条打开详情页，和抓正文共用 DETAIL_DAILY_CAP 这份访问量：
+    今日已抓正文 + 今日已确认下架，一起算已用。超了抛错熔断，否则返回还能核几条。"""
+    used = db.count_details_today() + db.count_delisted_today()
+    if used >= DETAIL_DAILY_CAP:
+        raise RuntimeError(
+            f"已触发每日详情页额度熔断：今日抓正文 {db.count_details_today()} 条 + "
+            f"核实下架 {db.count_delisted_today()} 条（上限 {DETAIL_DAILY_CAP}）。"
+            "请明天再跑，不要调大 config.py 里的 DETAIL_DAILY_CAP。")
+    print(f"  今日详情页已用 {used}/{DETAIL_DAILY_CAP} 条（抓正文+核实下架）")
+    return DETAIL_DAILY_CAP - used
+
+
+def verify_stale(days: int = STALE_AFTER_DAYS, limit: int | None = None) -> dict:
+    """核实"疑似已下架"的老职位：打开智通详情页读平台自己的招聘状态标志。
+    确认下架的记 delisted_at；仍在招的记 verified_at 并顺带把正文落库（占额度）。
+    与抓正文共用同一把锁：两条通道都是逐条撞详情页，不许并行。"""
+    if not _FETCH_LOCK.acquire(blocking=False):
+        raise RuntimeError("已有一批详情页请求正在跑（抓正文或核实下架），等它结束再来。")
+    try:
+        return _verify_stale(days, limit)
+    finally:
+        _FETCH_LOCK.release()
+
+
+def _verify_stale(days: int, limit: int | None) -> dict:
+    remaining = check_verify_cap()
+    if limit:
+        remaining = min(remaining, limit)
+    candidates = db.verify_candidates(days)
+    todo = candidates[:remaining]
+    total = len(candidates)
+    if not todo:
+        print(f"[核实] 没有超过 {days} 天未再采到、且还没确认下架的智通职位。")
+        return {"checked": 0, "delisted": 0, "alive": 0, "saved": 0, "failed": 0}
+    print(f"[核实] 超过 {days} 天未再采到的智通职位共 {total} 条，本次核 {len(todo)} 条"
+          f"（今日详情页剩余额度 {remaining} 条）")
+    checked = delisted = alive = saved = failed = 0
+    for n, job in enumerate(todo, 1):
+        print(f"[核实 {n}/{len(todo)}] #{job['platform_job_id']} {job.get('title') or ''}"
+              f" · 最近见到 {job.get('last_seen_at') or ''}")
+        rec = zhitong.verify_detail(job)
+        checked += 1
+        if rec is None:
+            failed += 1
+            continue
+        state = rec["state"]
+        if state is None:
+            print("  详情页认不出招聘状态（pcDetail 的 data-state 没了，平台改了结构），"
+                  "停止核实——要改的是 zhitong.py 的 parse_state，不是你的账号。")
+            break
+        # 两种下架标志都在 2026-11-18 实测对照过：页面挂"职位已过期"按钮、没有投递入口
+        if state in ("停止招聘", "已过期"):
+            db.mark_verified([(job["platform"], job["platform_job_id"])], True)
+            delisted += 1
+            print(f"  平台标记：{state} → 记为已下架")
+        elif state == "正常招聘":
+            db.mark_verified([(job["platform"], job["platform_job_id"])], False)
+            alive += 1
+            if rec["description"]:
+                saved += db.save_details(
+                    [{k: v for k, v in rec.items() if k != "state"}])
+            print(f"  平台标记：{state} → 仍在招"
+                  + ("，正文顺带入库" if rec["description"] else "（正文没解析出来，不写库）"))
+        else:
+            print(f"  平台给了没见过的状态「{state}」，不猜含义，停止核实。")
+            break
+        if n < len(todo):
+            polite_sleep()
+    left = max(0, DETAIL_DAILY_CAP - db.count_details_today() - db.count_delisted_today())
+    print(f"[核实] 本次核 {checked} 条：确认下架 {delisted}、仍在招 {alive}"
+          f"（正文入库 {saved}）、失败 {failed}；今日详情页还剩 {left} 条")
+    return {"checked": checked, "delisted": delisted, "alive": alive,
+            "saved": saved, "failed": failed, "left": left}

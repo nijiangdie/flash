@@ -16,7 +16,7 @@ INSERT_COLUMNS = (
     "platform", "platform_job_id", "title", "company", "salary_raw",
     "salary_min", "salary_max", "salary_months", "city", "district",
     "experience", "education", "industry", "company_scale",
-    "skills", "welfare", "url", "fetched_at",
+    "skills", "welfare", "url", "published_raw", "fetched_at",
 )
 # 与 config 的合规白名单保持一致，新增字段时两处需同步
 assert set(INSERT_COLUMNS) == ALLOWED_FIELDS, "INSERT_COLUMNS 与 ALLOWED_FIELDS 不一致"
@@ -47,11 +47,14 @@ CREATE TABLE IF NOT EXISTS jobs (
     skills TEXT,
     welfare TEXT,
     url TEXT,
+    published_raw TEXT,
     fetched_at TEXT,
     status TEXT,
     status_at TEXT,
     note TEXT,
     last_seen_at TEXT,
+    verified_at TEXT,
+    delisted_at TEXT,
     UNIQUE(platform, platform_job_id)
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_fetched ON jobs(fetched_at);
@@ -165,6 +168,11 @@ def init_db():
             # 补列之前的行没有"最近见到"，只能用入库时间顶上：老数据从没被重新采过，
             # 两者本来就相等。不回填的话筛选台上一整片会显示空白。
             c.execute("UPDATE jobs SET last_seen_at=fetched_at WHERE last_seen_at IS NULL")
+        # 发布时间/核实时刻/确认下架时刻：老行一律留 NULL——平台没给过的发布时间
+        # 不能拿采集时间顶（那是我们见到它的时刻，不是它发布的时刻），核实同理。
+        for col in ("published_raw", "verified_at", "delisted_at"):
+            if col not in cols:
+                c.execute(f"ALTER TABLE jobs ADD COLUMN {col} TEXT")
         # collect_runs 是前几轮加的表；先建起来的那版缺 rules / drop_titles，按同一套路补上
         run_cols = {r["name"] for r in c.execute("PRAGMA table_info(collect_runs)")}
         for col, decl in (("rules", "INTEGER"), ("drop_titles", "TEXT")):
@@ -181,7 +189,8 @@ def init_db():
 # 也不含 status/note/last_seen_at（本地标注和本层自己的时间戳，采集器写不到那些列）。
 REFRESH_COLUMNS = tuple(c for c in INSERT_COLUMNS
                         if c not in ("platform", "platform_job_id", "fetched_at"))
-_REFRESH_SQL = "UPDATE jobs SET {}, last_seen_at=? WHERE platform=? AND platform_job_id=?".format(
+_REFRESH_SQL = ("UPDATE jobs SET {}, last_seen_at=?, verified_at=?, delisted_at=? "
+                "WHERE platform=? AND platform_job_id=?").format(
     ", ".join(f"{c}=COALESCE(?, {c})" for c in REFRESH_COLUMNS))
 _JSON_COLUMNS = ("skills", "welfare")
 
@@ -215,9 +224,9 @@ def save_jobs(records: list[dict], stats: dict | None = None) -> int:
     """
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     added = refreshed = blocked = rules_hit = 0
-    insert_sql = "INSERT INTO jobs({},{}) VALUES({}{})".format(
-        ",".join(INSERT_COLUMNS), "last_seen_at",
-        ",".join("?" * len(INSERT_COLUMNS)), ",?")
+    insert_sql = "INSERT INTO jobs({},{},{},{}) VALUES({}{}{}{})".format(
+        ",".join(INSERT_COLUMNS), "last_seen_at", "verified_at", "delisted_at",
+        ",".join("?" * len(INSERT_COLUMNS)), ",?", ",?", ",?")
     with _conn() as c:
         known = {f"{r['platform']}:{r['platform_job_id']}"
                  for r in c.execute("SELECT platform, platform_job_id FROM jobs")}
@@ -225,6 +234,11 @@ def save_jobs(records: list[dict], stats: dict | None = None) -> int:
                         for r in c.execute("SELECT platform, platform_job_id FROM blocked_jobs")}
         companies, keywords = _load_block_rules(c)
         for r in records:
+            # _expire 是采集器交回的平台过期标志（前程无忧搜索接口自带），不是公开字段，
+            # 进白名单校验前先摘掉。能走到入库这一步就说明平台此刻仍把它列在搜索里，
+            # 所以 verified_at 一律记现在；标志说过期的才记 delisted_at。
+            expire = r.pop("_expire", None)
+            delisted = now if expire else None
             # 合规校验：只允许白名单字段
             bad = set(r) - ALLOWED_FIELDS
             if bad:
@@ -238,13 +252,15 @@ def save_jobs(records: list[dict], stats: dict | None = None) -> int:
                 continue
             if key in known:
                 c.execute(_REFRESH_SQL,
-                          _refresh_values(r) + [now, r["platform"], r["platform_job_id"]])
+                          _refresh_values(r) + [now, now, delisted,
+                                                r["platform"], r["platform_job_id"]])
                 refreshed += 1
             else:
                 row = dict(r, fetched_at=now)
                 row["skills"] = json.dumps(r.get("skills") or [], ensure_ascii=False)
                 row["welfare"] = json.dumps(r.get("welfare") or [], ensure_ascii=False)
-                c.execute(insert_sql, [row.get(k) for k in INSERT_COLUMNS] + [now])
+                c.execute(insert_sql,
+                          [row.get(k) for k in INSERT_COLUMNS] + [now, now, delisted])
                 known.add(key)
                 added += 1
     if stats is not None:
@@ -439,6 +455,66 @@ def count_details_today() -> int:
                 (today + "%",)).fetchone()[0]
         except sqlite3.OperationalError:  # 表尚未创建
             return 0
+
+
+def count_delisted_today() -> int:
+    """今天核实确认了多少条下架。核实下架也要打开详情页，和抓正文一样占
+    DETAIL_DAILY_CAP 的那份访问量；不把它算进去，一天就能核几百条下架页。"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    with _conn() as c:
+        try:
+            return c.execute(
+                "SELECT COUNT(*) FROM jobs WHERE delisted_at LIKE ?", (today + "%",)
+            ).fetchone()[0]
+        except sqlite3.OperationalError:  # 表尚未创建
+            return 0
+
+
+def mark_verified(keys: list[tuple[str, str]], delisted: bool) -> int:
+    """详情页核实后写状态：delisted=True 记确认下架时刻，否则清掉下架标记。
+    两种结果都记 verified_at——"核过且在招"和"核过且下架"都是核实结论。"""
+    if not keys:
+        return 0
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cond, args = _key_cond(keys)
+    with _conn() as c:
+        return c.execute(
+            f"UPDATE jobs SET verified_at=?, delisted_at=? WHERE {cond}",
+            [now, now if delisted else None] + args).rowcount
+
+
+def verify_candidates(days: int, platform: str = "zhitong") -> list[dict]:
+    """待核实候选：还没被确认下架、又超过 days 天没再采到的在招疑似行，最老的先核。
+    窗口期内核实过"仍在招"的不重复核——平台状态没变快，重核白烧详情页额度。"""
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT id, platform, platform_job_id, title, company, url, last_seen_at "
+            "FROM jobs WHERE platform=? AND IFNULL(delisted_at,'')='' "
+            "AND IFNULL(url,'')<>'' AND IFNULL(last_seen_at, fetched_at) < ? "
+            "AND (verified_at IS NULL OR verified_at < ?) "
+            "ORDER BY IFNULL(last_seen_at, fetched_at) ASC",
+            (platform, cutoff, cutoff)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def prune_candidates(days: int) -> list[dict]:
+    """清理候选：平台确认下架的，或超过 days 天没再采到的；自己标过投递进度
+    （status/note 非空）的一律不碰——那是你的投递清单，不是噪音。"""
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT id, platform, platform_job_id, title, company, last_seen_at, "
+            "delisted_at FROM jobs "
+            "WHERE IFNULL(status,'')='' AND IFNULL(note,'')='' "
+            "AND (IFNULL(delisted_at,'')<>'' OR IFNULL(last_seen_at, fetched_at) < ?) "
+            "ORDER BY IFNULL(last_seen_at, fetched_at) ASC", (cutoff,)).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["reason"] = "平台确认下架" if d["delisted_at"] else f"超过 {days} 天未再采到"
+        out.append(d)
+    return out
 
 
 def get_detail(platform: str, platform_job_id: str) -> dict | None:
@@ -666,6 +742,9 @@ def fetch_all() -> list[dict]:
         # 迁移前的老行这两列是 NULL，统一成空字符串，页面和导出都不用防 null
         d["status"] = d.get("status") or ""
         d["note"] = d.get("note") or ""
+        # 发布时间/核实/下架三列同理：补列之前的老行没这些信息，留空而不是假造
+        for col in ("published_raw", "verified_at", "delisted_at"):
+            d[col] = d.get(col) or ""
         # 薪资区间是入库那一刻算的，口径后来升级过（千/万、裸数字、只写一个数），
         # 没再采第二遍的老行就一直是 NULL；Boss 通道另有一套只认 "N-MK" 的写法。
         # 读的时候按原文兜一次：否则这些行在薪资轴、中位数、年薪和 CSV 里
@@ -701,7 +780,8 @@ EXPORT_FIELDS = ["platform", "platform_job_id", "title", "company", "salary_raw"
                  "salary_min", "salary_max", "salary_months", "salary_annual_wan",
                  "city", "district", "experience", "education", "industry",
                  "company_scale", "skills", "welfare", "status", "status_at", "note",
-                 "url", "fetched_at", "description"]
+                 "url", "fetched_at", "published_raw", "verified_at", "delisted_at",
+                 "description"]
 
 
 def export_csv(path):
@@ -736,7 +816,8 @@ BATCH_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}\.json$")
 # （report.py 的 seenAt 会退回 fetched_at）——第一次采到在 14 天前的在职职位，
 # 撤回来就被标成下架了。status_at 同理：漏掉它，删一条再撤回来就把"投出去几天了"
 # 抹成没有日期，那条从此进不了按周算的分母。
-RESTORE_JOBS = INSERT_COLUMNS + ("status", "status_at", "note", "last_seen_at")
+RESTORE_JOBS = INSERT_COLUMNS + ("status", "status_at", "note", "last_seen_at",
+                                 "verified_at", "delisted_at")
 
 
 def _tables(c) -> set:

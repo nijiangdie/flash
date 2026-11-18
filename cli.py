@@ -14,6 +14,9 @@
   python cli.py runs                              # 最近几次采集用的什么词、剔掉多少、被拦的是谁（留痕）
   python cli.py detail --ids 562,560            # 只给要投的那几条抓正文（JD）
   python cli.py detail --platform zhitong --limit 5   # 挑缺正文的职位补抓
+  python cli.py verify                         # 核实疑似下架的老职位（读平台招聘状态标志）
+  python cli.py prune                          # 预览可清理的老职位（报数不动库）
+  python cli.py prune --apply                  # 真清理：回收站批次，可撤销
   python cli.py analyze                         # 本机大模型算匹配度（LM Studio，不出这台机器）
   python cli.py analyze --limit 5 --model qwen3.5-9b
   python cli.py analyze --dry-run               # 只看送出去的提示词，不调模型
@@ -35,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from jobstats import analyze, browser, db, details, relevance, report, server
 from jobstats.collectors import COLLECTORS, collect_and_save
 from jobstats.config import (ANALYSIS_PROFILE_PATH, ANALYZE_BATCH_DEFAULT, DAILY_CAP,
-                             DETAIL_DAILY_CAP, LLM_BASE_URL, LLM_MODEL)
+                             DETAIL_DAILY_CAP, LLM_BASE_URL, LLM_MODEL, STALE_AFTER_DAYS)
 
 
 def cmd_login(args):
@@ -427,6 +430,38 @@ def cmd_detail(args):
     details.collect_details(jobs, limit=args.limit, force=args.force)
 
 
+def cmd_verify(args):
+    db.init_db()
+    details.verify_stale(days=args.days, limit=args.limit)
+
+
+def cmd_prune(args):
+    db.init_db()
+    rows = db.prune_candidates(args.days)
+    if not rows:
+        print(f"没有可清理的职位（确认下架的、或超过 {args.days} 天未再采到且没标过投递进度的）。")
+        return
+    reasons = Counter(r["reason"] for r in rows)
+    print(f"清理候选 {len(rows)} 条：" + "、".join(f"{k} {v} 条" for k, v in reasons.items()))
+    for r in rows[:10]:
+        print(f"  #{r['id']} {r['platform']} {r['title']} · {r['company']} · {r['reason']}")
+    if len(rows) > 10:
+        print(f"  ……其余 {len(rows) - 10} 条略")
+    if not args.apply:
+        print("以上是预览，没动库。确认要清就加 --apply：走回收站删除，可撤销，"
+              "同时进屏蔽名单（撤销会一并退出名单）。标过想投/已投等进度的行不在候选里。")
+        return
+    batches = []
+    for i in range(0, len(rows), db.DELETE_MAX):
+        chunk = rows[i:i + db.DELETE_MAX]
+        res = db.delete_jobs([r["id"] for r in chunk])
+        batches.append(res["batch"])
+        print(f"  已删 {res['deleted']} 条（连带正文 {res['details']}、分析 {res['analysis']}），"
+              f"回收站批次 {res['batch']}")
+    print(f"共清理 {len(rows)} 条，{len(batches)} 个批次。反悔就在筛选台的「撤销」里"
+          "按批次恢复（撤销会一并退出屏蔽名单）。")
+
+
 def cmd_analyze(args):
     db.init_db()
     analyze.run(limit=args.limit, platform=args.platform, redo=args.redo,
@@ -522,6 +557,20 @@ def main():
                    help=f"本次最多抓几条（默认不超过每日额度 {DETAIL_DAILY_CAP} 条）")
     p.add_argument("--force", action="store_true", help="已有正文的也重抓覆盖")
     p.set_defaults(func=cmd_detail)
+
+    p = sub.add_parser("verify", help="核实疑似下架的老职位：读智通详情页平台自己的招聘状态标志")
+    p.add_argument("--days", type=int, default=STALE_AFTER_DAYS,
+                   help=f"超过多少天没再采到才算疑似（默认 {STALE_AFTER_DAYS}，与页面「疑似已下架」同口径）")
+    p.add_argument("--limit", type=int, default=None,
+                   help=f"本次最多核几条（默认不超过今日详情页剩余额度 {DETAIL_DAILY_CAP} 条）")
+    p.set_defaults(func=cmd_verify)
+
+    p = sub.add_parser("prune", help="清理老职位：默认只预览报数，加 --apply 才真删（可撤销）")
+    p.add_argument("--days", type=int, default=30,
+                   help="超过多少天没再采到算候选（默认 30；平台确认下架的不受天数限制）")
+    p.add_argument("--apply", action="store_true",
+                   help="真删：走回收站批次，可撤销；标过投递进度的行一律不碰")
+    p.set_defaults(func=cmd_prune)
 
     p = sub.add_parser("analyze",
                        help="本机大模型算职位匹配度：只连 LM Studio，不访问任何招聘平台")
